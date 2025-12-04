@@ -385,55 +385,49 @@ public class Data_Extraction_M1_Optimized {
 
         String json = Files.readString(jsonPath, StandardCharsets.UTF_8);
 
-        int index = 0;
-        while (true) {
-            int filenamePos = json.indexOf("\"filename\"", index);
-            if (filenamePos < 0) {
-                break;
-            }
+        // Match both FLOODING followed by filename and filename followed by FLOODING
+        int before = floodBySentinelName.size();
 
-            int colonPos = json.indexOf(':', filenamePos);
-            if (colonPos < 0) break;
+        // Example pattern inside each object:
+        //   "FLOODING": false ... "filename": "S2_2019-02-04"
+        java.util.regex.Pattern floodingThenFile = java.util.regex.Pattern.compile(
+                "\\\"FLOODING\\\"\\s*:\\s*(true|false).*?\\\"filename\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"",
+                java.util.regex.Pattern.CASE_INSENSITIVE | java.util.regex.Pattern.DOTALL);
 
-            int quoteStart = json.indexOf('"', colonPos + 1);
-            if (quoteStart < 0) break;
-            int quoteEnd = json.indexOf('"', quoteStart + 1);
-            if (quoteEnd < 0) break;
+        // Sometimes filename may appear before FLOODING; match that as well.
+        java.util.regex.Pattern fileThenFlooding = java.util.regex.Pattern.compile(
+                "\\\"filename\\\"\\s*:\\s*\\\"([^\\\"]+)\\\".*?\\\"FLOODING\\\"\\s*:\\s*(true|false)",
+                java.util.regex.Pattern.CASE_INSENSITIVE | java.util.regex.Pattern.DOTALL);
 
-            String filename = json.substring(quoteStart + 1, quoteEnd).trim();
-            String baseName = stripExtension(filename);
+        addMatches(json, floodingThenFile, floodBySentinelName);
+        addMatches(json, fileThenFlooding, floodBySentinelName);
 
-            int windowStart = Math.max(0, filenamePos - 2000);
-            String window = json.substring(windowStart, filenamePos);
-
-            Boolean floodingValue = locateFloodingValue(window);
-            if (floodingValue != null) {
-                floodBySentinelName.put(baseName, floodingValue);
-            }
-
-            index = quoteEnd + 1;
+        int added = floodBySentinelName.size() - before;
+        if (added == 0) {
+            System.out.println("[WARN] No FLOODING entries found in " + jsonPath.getFileName() + " (pattern mismatch).");
+        } else {
+            System.out.println("[INFO] Parsed " + added + " labeled entries from " + jsonPath.getFileName());
         }
-
-        System.out.println("[INFO] Parsed " + floodBySentinelName.size() + " labeled entries from " + jsonPath.getFileName());
     }
 
-    private static Boolean locateFloodingValue(String window) {
-        int floodingPos = window.lastIndexOf("\"FLOODING\"");
-        if (floodingPos < 0) return null;
+    private static void addMatches(String json, java.util.regex.Pattern pattern, Map<String, Boolean> floodBySentinelName) {
+        java.util.regex.Matcher matcher = pattern.matcher(json);
+        while (matcher.find()) {
+            // Group order flips depending on pattern, so test group count.
+            boolean firstIsFlood = matcher.group(1).equalsIgnoreCase("true") || matcher.group(1).equalsIgnoreCase("false");
+            boolean flooding;
+            String filename;
+            if (firstIsFlood) {
+                flooding = Boolean.parseBoolean(matcher.group(1));
+                filename = matcher.group(2);
+            } else {
+                filename = matcher.group(1);
+                flooding = Boolean.parseBoolean(matcher.group(2));
+            }
 
-        int colonPos = window.indexOf(':', floodingPos);
-        if (colonPos < 0) return null;
-
-        String tail = window.substring(colonPos + 1).toLowerCase(Locale.ROOT);
-
-        if (tail.contains("true")) {
-            return Boolean.TRUE;
+            String baseName = stripExtension(filename.trim());
+            floodBySentinelName.put(baseName, flooding);
         }
-        if (tail.contains("false")) {
-            return Boolean.FALSE;
-        }
-
-        return null;
     }
 
     private static String stripExtension(String filename) {
