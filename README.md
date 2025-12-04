@@ -43,7 +43,7 @@ When you run the program it performs the full pipeline without any extra scripts
   - **XY_TABLE / DECISION_RULE**: `XY_TABLE` includes its own column guide; `DECISION_RULE` note shows the scoring equation with reliability scaling.
 
 ### Decision_Table_Java.csv
-- Lists every observed combination and includes a confidence label from *n* (Extremely Low → High). Unstable rows (tiny *n* or extreme rates) carry an explanatory note in the final column; sorting remains by flood probability and then by margin of error so the most reliable signals appear first.
+- Lists every observed combination and includes a confidence label from *n* (Extremely Low → High). Unstable rows (tiny *n* or extreme rates) carry an explanatory note in the final column; sorting remains by flood probability and then by margin of error so the most reliable signals appear first. A `leans_toward` column flags whether the empirical rate favors predicting flood (`flood`) or no flood (`no_flood`).
 
 ### Auto_Probabilities.csv
 - Uses the same decision-rule score described in `Summary_All.csv`: `score = confidence_adjusted(w_raw*z_raw_mean + w_bd*z_black_diameter + w_wd*z_white_diameter + w_season + w_pol + w_black_shape + w_white_shape); each categorical weight is multiplied by reliability n/(n+50); z_feature = (x - mean_all)/std_all; probability = 1/(1+exp(-score))`. The header comment reiterates that this probability is the confidence-weighted chance of flooding for the given attributes, and rows are sorted from highest to lowest probability.

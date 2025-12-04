@@ -218,6 +218,7 @@ public class Data_Extraction_M1_Optimized {
         double ciHigh95;
         String confidenceFromN;
         boolean unstableExtremeFlag;
+        String leaningPrediction;
     }
 
     private static class LogisticModel {
@@ -2156,6 +2157,9 @@ public class Data_Extraction_M1_Optimized {
                 dc.ciHigh95 = Double.NaN;
             }
             dc.confidenceFromN = confidenceLabel(dc.samples);
+            dc.leaningPrediction = Double.isNaN(dc.empiricalFloodRate)
+                    ? "unknown"
+                    : (dc.empiricalFloodRate >= 0.5 ? "flood" : "no_flood");
 
             boolean extreme = (dc.empiricalFloodRate == 0.0 || dc.empiricalFloodRate == 1.0);
             boolean tiny = dc.samples < 10;
@@ -2228,6 +2232,7 @@ public class Data_Extraction_M1_Optimized {
                     "margin_of_error_95",
                     "flood_rate_CI_low_95",
                     "flood_rate_CI_high_95",
+                    "leans_toward",
                     "confidence_from_n",
                     "unstable_extreme_flag",
                     "notes"
@@ -2266,6 +2271,7 @@ public class Data_Extraction_M1_Optimized {
                         Double.toString(dc.marginOfError95),
                         Double.toString(dc.ciLow95),
                         Double.toString(dc.ciHigh95),
+                        dc.leaningPrediction,
                         dc.confidenceFromN,
                         Boolean.toString(dc.unstableExtremeFlag),
                         note
