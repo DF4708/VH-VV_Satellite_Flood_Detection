@@ -10,8 +10,6 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 
 import java.util.*;
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Method;
 import java.util.concurrent.*;
 
 /**
@@ -64,8 +62,8 @@ import java.util.concurrent.*;
  *       3) Skipped.csv
  *          One row per image that was not processed (no label, TIFF decoding error, etc).
  *
- *   - After CSV generation, optionally calls SummaryGeneratorLogistic.main(rootFolderPath)
- *     as a follow-on step if the class is available on the classpath.
+ *   - After CSV generation, automatically writes Auto_Probabilities.csv with lightweight
+ *     logistic-style scores using only standard JDK classes (no external dependencies).
  */
 public class Data_Extraction_M1_Optimized {
 
