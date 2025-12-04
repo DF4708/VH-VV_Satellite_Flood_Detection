@@ -122,6 +122,21 @@ public class Data_Extraction_M1_Optimized {
         String dominantShape;
     }
 
+    private static class MasksAndComponents {
+        Component blackComponent;
+        Component whiteComponent;
+        boolean[][] blackMask;
+        boolean[][] whiteMask;
+
+        MasksAndComponents(Component blackComponent, Component whiteComponent,
+                           boolean[][] blackMask, boolean[][] whiteMask) {
+            this.blackComponent = blackComponent;
+            this.whiteComponent = whiteComponent;
+            this.blackMask = blackMask;
+            this.whiteMask = whiteMask;
+        }
+    }
+
     private static class ImageJob {
         final Path imagePath;
         final String folderName;
@@ -637,49 +652,49 @@ public class Data_Extraction_M1_Optimized {
 
         double rawMean = (pixelCount > 0) ? (double) sumRaw / (double) pixelCount : 0.0;
 
-        // Darkest 20 and brightest 20 present RAW values (zeros still included as "darkest").
-        Set<Integer> darkSet = new HashSet<>();
-        Set<Integer> brightSet = new HashSet<>();
-        int darkNeeded = 20;
-        int brightNeeded = 20;
+        List<Integer> darkSeeds = new ArrayList<>();
+        List<Integer> brightSeeds = new ArrayList<>();
+        for (int v = 1; v <= maxSample && darkSeeds.size() < 3; v++) {
+            if (hist[v] > 0) darkSeeds.add(v);
+        }
+        for (int v = maxSample; v >= 1 && brightSeeds.size() < 3; v--) {
+            if (hist[v] > 0) brightSeeds.add(v);
+        }
 
-        for (int v = 0; v <= maxSample && darkSet.size() < darkNeeded; v++) {
-            if (hist[v] > 0) darkSet.add(v);
-        }
-        for (int v = maxSample; v >= 0 && brightSet.size() < brightNeeded; v--) {
-            if (hist[v] > 0) brightSet.add(v);
-        }
+        Set<Integer> allowedBlack = buildAllowedShadeSet(darkSeeds, maxSample, 1);
+        Set<Integer> allowedWhite = buildAllowedShadeSet(brightSeeds, maxSample, 1);
 
         Map<String, Integer> rawCounts = new HashMap<>();
-        boolean[][] blackMask = new boolean[height][width];
-        boolean[][] whiteMask = new boolean[height][width];
+        MasksAndComponents mac = buildMasksAndComponents(raster, bands, maxSample, width, height,
+                allowedBlack, allowedWhite, rawCounts);
 
-        for (int y = 0; y < height; y++) {
-            boolean[] blackRow = blackMask[y];
-            boolean[] whiteRow = whiteMask[y];
+        double minAreaRatio = 0.05;
+        double maxAreaRatio = 0.40;
+        int totalPixels = width * height;
 
-            for (int x = 0; x < width; x++) {
-                int raw = sampleRaw(raster, bands, maxSample, x, y);
-                String key = String.format("RAW_%05d", raw);
-                int old = rawCounts.getOrDefault(key, 0);
-                rawCounts.put(key, old + 1);
-
-                boolean isBlack = darkSet.contains(raw);
-                boolean isWhite = brightSet.contains(raw);
-
-                if (isBlack && !isWhite) {
-                    blackRow[x] = true;
-                } else if (isWhite && !isBlack) {
-                    whiteRow[x] = true;
-                } else {
-                    blackRow[x] = false;
-                    whiteRow[x] = false;
-                }
-            }
+        if (mac.blackComponent.pixelCount < totalPixels * minAreaRatio ||
+                mac.whiteComponent.pixelCount < totalPixels * minAreaRatio) {
+            // Expand tolerance to ±2 if initial contiguous region is too small.
+            allowedBlack = buildAllowedShadeSet(darkSeeds, maxSample, 2);
+            allowedWhite = buildAllowedShadeSet(brightSeeds, maxSample, 2);
+            mac = buildMasksAndComponents(raster, bands, maxSample, width, height, allowedBlack, allowedWhite, rawCounts);
         }
 
-        Component blackComponent = findLargestComponent(blackMask);
-        Component whiteComponent = findLargestComponent(whiteMask);
+        Component blackComponent = mac.blackComponent;
+        Component whiteComponent = mac.whiteComponent;
+
+        int maxPixels = (int) Math.max(1, maxAreaRatio * totalPixels);
+        if (blackComponent.pixelCount > maxPixels) blackComponent.pixelCount = 0;
+        if (whiteComponent.pixelCount > maxPixels) whiteComponent.pixelCount = 0;
+
+        if (blackComponent.pixelCount == 0) {
+            blackComponent = new Component();
+            blackComponent.update(width / 2, height / 2);
+        }
+        if (whiteComponent.pixelCount == 0) {
+            whiteComponent = new Component();
+            whiteComponent.update(width / 2, height / 2);
+        }
 
         if (blackComponent.pixelCount == 0 && whiteComponent.pixelCount > 0) {
             blackComponent.minX = whiteComponent.minX;
@@ -712,6 +727,9 @@ public class Data_Extraction_M1_Optimized {
 
         Component blackAdjusted = new Component();
         Component whiteAdjusted = new Component();
+
+        boolean[][] blackMask = mac.blackMask;
+        boolean[][] whiteMask = mac.whiteMask;
 
         for (int y = 0; y < height; y++) {
             boolean[] blackRow = blackMask[y];
@@ -760,9 +778,9 @@ public class Data_Extraction_M1_Optimized {
             String firstKey = sortedRaw.get(0).getKey();
             try {
                 int dominantRaw = Integer.parseInt(firstKey.substring(4));
-                if (darkSet.contains(dominantRaw) && !brightSet.contains(dominantRaw)) {
+                if (allowedBlack.contains(dominantRaw) && !allowedWhite.contains(dominantRaw)) {
                     dominantShape = "black";
-                } else if (brightSet.contains(dominantRaw) && !darkSet.contains(dominantRaw)) {
+                } else if (allowedWhite.contains(dominantRaw) && !allowedBlack.contains(dominantRaw)) {
                     dominantShape = "white";
                 } else {
                     dominantShape = "mixed";
@@ -789,6 +807,57 @@ public class Data_Extraction_M1_Optimized {
         return analysis;
     }
 
+    private static Set<Integer> buildAllowedShadeSet(List<Integer> seeds, int maxSample, int radius) {
+        Set<Integer> allowed = new HashSet<>();
+        for (int seed : seeds) {
+            for (int delta = -radius; delta <= radius; delta++) {
+                int v = seed + delta;
+                if (v <= 0 || v > maxSample) continue;
+                allowed.add(v);
+            }
+        }
+        return allowed;
+    }
+
+    private static MasksAndComponents buildMasksAndComponents(
+            Raster raster,
+            int bands,
+            int maxSample,
+            int width,
+            int height,
+            Set<Integer> allowedBlack,
+            Set<Integer> allowedWhite,
+            Map<String, Integer> rawCounts
+    ) {
+        boolean[][] blackMask = new boolean[height][width];
+        boolean[][] whiteMask = new boolean[height][width];
+
+        for (int y = 0; y < height; y++) {
+            boolean[] blackRow = blackMask[y];
+            boolean[] whiteRow = whiteMask[y];
+            for (int x = 0; x < width; x++) {
+                int raw = sampleRaw(raster, bands, maxSample, x, y);
+                String key = String.format("RAW_%05d", raw);
+                rawCounts.put(key, rawCounts.getOrDefault(key, 0) + 1);
+
+                boolean isBlack = allowedBlack.contains(raw);
+                boolean isWhite = allowedWhite.contains(raw);
+
+                if (isBlack && !isWhite) {
+                    blackRow[x] = true;
+                } else if (isWhite && !isBlack) {
+                    whiteRow[x] = true;
+                }
+            }
+        }
+
+        int maxPixels = width * height;
+        Component blackComponent = findLargestComponent(blackMask, maxPixels);
+        Component whiteComponent = findLargestComponent(whiteMask, maxPixels);
+
+        return new MasksAndComponents(blackComponent, whiteComponent, blackMask, whiteMask);
+    }
+
     private static int sampleRaw(Raster raster, int bands, int maxSample, int x, int y) {
         int raw;
         if (bands == 1) {
@@ -806,7 +875,7 @@ public class Data_Extraction_M1_Optimized {
         return raw;
     }
 
-    private static Component findLargestComponent(boolean[][] mask) {
+    private static Component findLargestComponent(boolean[][] mask, int maxAllowedPixels) {
         int height = mask.length;
         int width = (height > 0) ? mask[0].length : 0;
 
@@ -845,7 +914,7 @@ public class Data_Extraction_M1_Optimized {
                     }
                 }
 
-                if (comp.pixelCount > best.pixelCount) {
+                if (comp.pixelCount > best.pixelCount && comp.pixelCount <= maxAllowedPixels) {
                     best = comp;
                 }
             }
@@ -866,25 +935,25 @@ public class Data_Extraction_M1_Optimized {
 
         double fillRatio = (double) comp.pixelCount / (double) (width * height);
 
-        if (fillRatio >= 0.82 && aspect <= 1.08) {
+        if (fillRatio >= 0.88 && aspect <= 1.05) {
             return "square";
         }
-        if (fillRatio >= 0.78 && aspect > 1.08 && aspect < 2.8) {
+        if (fillRatio >= 0.80 && aspect > 1.05 && aspect < 2.4) {
             return "rectangle";
         }
-        if (fillRatio > 0.68 && aspect <= 1.15) {
+        if (fillRatio > 0.75 && aspect <= 1.10) {
             return "circle";
         }
-        if (fillRatio > 0.55 && aspect > 1.15 && aspect < 2.5) {
+        if (fillRatio > 0.62 && aspect > 1.10 && aspect < 2.1) {
             return "ellipse";
         }
-        if (fillRatio > 0.4 && aspect >= 2.5) {
+        if (fillRatio > 0.45 && aspect >= 2.1 && aspect < 3.5) {
             return "parallelogram";
         }
-        if (fillRatio > 0.3 && aspect >= 3.0) {
+        if (fillRatio > 0.32 && aspect >= 3.5) {
             return "trapezium";
         }
-        if (fillRatio > 0.2) {
+        if (fillRatio > 0.22) {
             return "triangle";
         }
         return "crescent";
@@ -964,18 +1033,6 @@ public class Data_Extraction_M1_Optimized {
         header.add("margin_of_error_95");
         out.add(header);
 
-        out.add(row7("NOTE", "columns_general",
-                "value_a/value_b/value_c/value_d meanings are section-specific; see notes rows below. Baseline/confidence/SE/CI/margin columns are populated for LOGIT_SUMMARY and left blank elsewhere.",
-                "",
-                "",
-                "",
-                ""));
-        out.add(row7("NOTE", "columns_stats",
-                "STATS: value_a = flooding=true metric, value_b = flooding=false metric; value_c/value_d noted per row",
-                "",
-                "",
-                "",
-                ""));
         out.add(row7("NOTE", "columns_seasons_shapes",
                 "SEASONS/SHAPES: value_a = flooding=true count, value_b = flooding=false count, value_c = true_rate",
                 "",
@@ -1020,13 +1077,13 @@ public class Data_Extraction_M1_Optimized {
                     "logit_coefficient",
                     "odds_ratio",
                     "samples",
-                    "Each row has explicit baseline/confidence/SE/CI/margin columns.",
-                    "baseline",
+                    "baseline_category",
                     "confidence_from_n",
                     "standard_error",
                     "ci_low_95",
                     "ci_high_95",
-                    "margin_of_error_95"));
+                    "margin_of_error_95",
+                    ""));
 
             for (CategoryStats cs : logisticBundle.stats) {
                 out.add(row13("LOGIT_SUMMARY", cs.attribute + ":" + cs.category,
@@ -1034,13 +1091,13 @@ public class Data_Extraction_M1_Optimized {
                         Double.toString(cs.logitCoefficient),
                         Double.toString(cs.oddsRatio),
                         Integer.toString(cs.samples),
-                        "",
                         cs.baselineCategory,
                         cs.confidenceFromN,
                         Double.toString(cs.standardError),
                         Double.toString(cs.ciLow95),
                         Double.toString(cs.ciHigh95),
-                        Double.toString(cs.marginOfError95)));
+                        Double.toString(cs.marginOfError95),
+                        ""));
             }
 
             out.add(row7("", "", "", "", "", "", ""));
@@ -1060,7 +1117,7 @@ public class Data_Extraction_M1_Optimized {
         ruleRow.add("");
         ruleRow.add("");
         ruleRow.add("");
-        ruleRow.add("score = w_raw*z_raw_mean + w_bd*z_black_diameter + w_wd*z_white_diameter + w_season + w_pol + w_black_shape + w_white_shape; z_feature = (x - mean_all)/std_all; P(FLOODING=true) = 1/(1+exp(-score)).");
+        ruleRow.add("score = confidence_adjusted(w_raw*z_raw_mean + w_bd*z_black_diameter + w_wd*z_white_diameter + w_season + w_pol + w_black_shape + w_white_shape); each categorical weight is multiplied by reliability n/(n+50); z_feature = (x - mean_all)/std_all; P(FLOODING=true) = 1/(1+exp(-score)).");
         out.add(ruleRow);
 
         return out;
@@ -1321,24 +1378,17 @@ public class Data_Extraction_M1_Optimized {
             }
         }
 
-        out.add(row7("SHAPES", "NOTE",
-                "",
-                "",
-                "",
-                "",
-                "Each image contributes one black and one white largest component (after filters and fallback)."));
-
         Set<String> allShapesBlack = new TreeSet<>(blackTrue.keySet());
         allShapesBlack.addAll(blackFalse.keySet());
         for (String s : allShapesBlack) {
             int ct = blackTrue.getOrDefault(s, 0);
             int cf = blackFalse.getOrDefault(s, 0);
             out.add(row7("SHAPES", "black_" + s,
+                    Integer.toString(ct + cf),
                     Integer.toString(ct),
-                    Integer.toString(cf),
                     "",
                     "",
-                    "Largest black-component shape = " + s));
+                    "count_flooding=" + ct + "; count_nonflood=" + cf));
         }
 
         Set<String> allShapesWhite = new TreeSet<>(whiteTrue.keySet());
@@ -1347,11 +1397,11 @@ public class Data_Extraction_M1_Optimized {
             int ct = whiteTrue.getOrDefault(s, 0);
             int cf = whiteFalse.getOrDefault(s, 0);
             out.add(row7("SHAPES", "white_" + s,
+                    Integer.toString(ct + cf),
                     Integer.toString(ct),
-                    Integer.toString(cf),
                     "",
                     "",
-                    "Largest white-component shape = " + s));
+                    "count_flooding=" + ct + "; count_nonflood=" + cf));
         }
 
         return out;
@@ -2180,14 +2230,47 @@ public class Data_Extraction_M1_Optimized {
                     "unstable_extreme_flag"
             ));
 
-            boolean wrote = false;
+            List<DecisionCombo> passHigh = new ArrayList<>();
+            List<DecisionCombo> passLow = new ArrayList<>();
             for (DecisionCombo dc : combos) {
-                boolean passesFloodRate = dc.empiricalFloodRate >= 0.5;
                 boolean passesSample = dc.samples > 358; // strictly greater than 358
                 boolean passesMargin = !Double.isNaN(dc.marginOfError95) && dc.marginOfError95 <= 0.0954;
-                if (!(passesFloodRate && passesSample && passesMargin)) {
-                    continue;
+                if (!passesSample || !passesMargin) continue;
+                if (dc.empiricalFloodRate >= 0.5) {
+                    passHigh.add(dc);
+                } else {
+                    passLow.add(dc);
                 }
+            }
+
+            Comparator<DecisionCombo> byConfidence = Comparator
+                    .comparing((DecisionCombo d) -> d.marginOfError95)
+                    .thenComparing(d -> -d.samples);
+            passHigh.sort(byConfidence);
+            passLow.sort(byConfidence);
+
+            int topCount = 3;
+            boolean wrote = false;
+            for (int i = 0; i < Math.min(topCount, passHigh.size()); i++) {
+                DecisionCombo dc = passHigh.get(i);
+                wrote = true;
+                pw.println(String.join(",",
+                        safe(dc.season),
+                        safe(dc.polarization),
+                        safe(dc.blackShape),
+                        safe(dc.whiteShape),
+                        Integer.toString(dc.samples),
+                        Double.toString(dc.empiricalFloodRate),
+                        Double.toString(dc.standardError),
+                        Double.toString(dc.marginOfError95),
+                        Double.toString(dc.ciLow95),
+                        Double.toString(dc.ciHigh95),
+                        dc.confidenceFromN,
+                        Boolean.toString(dc.unstableExtremeFlag)
+                ));
+            }
+            for (int i = 0; i < Math.min(topCount, passLow.size()); i++) {
+                DecisionCombo dc = passLow.get(i);
                 wrote = true;
                 pw.println(String.join(",",
                         safe(dc.season),
@@ -2206,17 +2289,9 @@ public class Data_Extraction_M1_Optimized {
             }
 
             if (!wrote) {
-                // Fallback: still surface the strongest combinations so the table is never empty.
-                List<DecisionCombo> fallback = new ArrayList<>();
-                for (DecisionCombo dc : combos) {
-                    if (dc.samples >= 50 && dc.empiricalFloodRate >= 0.5) {
-                        fallback.add(dc);
-                    }
-                }
-                fallback.sort(Comparator.comparing((DecisionCombo d) -> d.empiricalFloodRate).reversed()
-                        .thenComparing(d -> -d.samples));
-
-                int limit = Math.min(15, fallback.size());
+                List<DecisionCombo> fallback = new ArrayList<>(combos);
+                fallback.sort(byConfidence);
+                int limit = Math.min(6, fallback.size());
                 for (int i = 0; i < limit; i++) {
                     DecisionCombo dc = fallback.get(i);
                     pw.println(String.join(",",
@@ -2293,11 +2368,25 @@ public class Data_Extraction_M1_Optimized {
         double maxBlack = 0.0;
         double maxWhite = 0.0;
 
+        Map<String, int[]> seasonCounts = new HashMap<>();
+        Map<String, int[]> polCounts = new HashMap<>();
+        Map<String, int[]> blackShapeCounts = new HashMap<>();
+        Map<String, int[]> whiteShapeCounts = new HashMap<>();
+
+        int floodTotal = 0;
+
         for (ImageRecord rec : records) {
             rawSum += rec.rawMean;
             rawSqSum += rec.rawMean * rec.rawMean;
             if (rec.blackDiameter > maxBlack) maxBlack = rec.blackDiameter;
             if (rec.whiteDiameter > maxWhite) maxWhite = rec.whiteDiameter;
+
+            addCount(seasonCounts, safe(rec.season), rec.flooding);
+            addCount(polCounts, safe(rec.polarization), rec.flooding);
+            addCount(blackShapeCounts, safe(rec.blackShape), rec.flooding);
+            addCount(whiteShapeCounts, safe(rec.whiteShape), rec.flooding);
+
+            if (rec.flooding) floodTotal++;
         }
 
         double count = records.size();
@@ -2308,22 +2397,37 @@ public class Data_Extraction_M1_Optimized {
         if (maxBlack == 0.0) maxBlack = 1.0;
         if (maxWhite == 0.0) maxWhite = 1.0;
 
+        double overallFloodRate = (count > 0.0) ? (floodTotal / count) : 0.0;
+
+        Map<String, Double> seasonWeight = deriveWeights(seasonCounts, overallFloodRate);
+        Map<String, Double> polWeight = deriveWeights(polCounts, overallFloodRate);
+        Map<String, Double> blackWeight = deriveWeights(blackShapeCounts, overallFloodRate);
+        Map<String, Double> whiteWeight = deriveWeights(whiteShapeCounts, overallFloodRate);
+
         Path autoPath = rootFolder.resolve("Auto_Probabilities.csv");
 
         try (BufferedWriter writer = Files.newBufferedWriter(autoPath, StandardCharsets.UTF_8)) {
-            writer.write("image_name,folder_name,polarization,season,label_flooding,score,probability");
+            writer.write("# score = confidence_adjusted(z_raw + diameters + categorical weights); probability = logistic(score)");
             writer.newLine();
+            writer.write("image_name,folder_name,polarization,season,black_shape,white_shape,label_flooding,score,probability");
+            writer.newLine();
+
+            List<List<String>> rows = new ArrayList<>();
 
             for (ImageRecord rec : records) {
                 double zRaw = (stddev > 0.0) ? (rec.rawMean - mean) / stddev : 0.0;
                 double normBlack = rec.blackDiameter / maxBlack;
                 double normWhite = rec.whiteDiameter / maxWhite;
 
-                double seasonBias = seasonBias(rec.season);
-                double polBias = polarizationBias(rec.polarization);
-                double shapeBias = shapeBias(rec.dominantShape);
+                double sWeight = seasonWeight.getOrDefault(safe(rec.season), 0.0);
+                double pWeight = polWeight.getOrDefault(safe(rec.polarization), 0.0);
+                double bWeight = blackWeight.getOrDefault(safe(rec.blackShape), 0.0);
+                double wWeight = whiteWeight.getOrDefault(safe(rec.whiteShape), 0.0);
 
-                double score = zRaw + (0.6 * normBlack) + (0.6 * normWhite) + seasonBias + polBias + shapeBias;
+                double score = zRaw
+                        + (0.6 * normBlack)
+                        + (0.6 * normWhite)
+                        + sWeight + pWeight + bWeight + wWeight;
                 double probability = 1.0 / (1.0 + Math.exp(-score));
 
                 List<String> row = Arrays.asList(
@@ -2331,10 +2435,18 @@ public class Data_Extraction_M1_Optimized {
                         rec.folderName,
                         rec.polarization,
                         rec.season,
+                        rec.blackShape,
+                        rec.whiteShape,
                         Boolean.toString(rec.flooding),
                         Double.toString(score),
                         Double.toString(probability)
                 );
+                rows.add(row);
+            }
+
+            rows.sort((a, b) -> Double.compare(Double.parseDouble(b.get(8)), Double.parseDouble(a.get(8))));
+
+            for (List<String> row : rows) {
                 writer.write(escapeCsvRow(row));
                 writer.newLine();
             }
@@ -2343,40 +2455,31 @@ public class Data_Extraction_M1_Optimized {
         System.out.println("[INFO] Auto_Probabilities.csv written with lightweight logistic-style scores in: " + rootFolder);
     }
 
-    private static double seasonBias(String season) {
-        if (season == null) return 0.0;
-        switch (season) {
-            case "Summer":
-                return 0.25;
-            case "Spring":
-            case "Fall":
-                return 0.15;
-            case "Winter":
-                return -0.05;
-            default:
-                return 0.0;
+    private static Map<String, Double> deriveWeights(Map<String, int[]> counts, double overallFloodRate) {
+        Map<String, Double> out = new HashMap<>();
+        for (Map.Entry<String, int[]> e : counts.entrySet()) {
+            int[] arr = e.getValue();
+            int falseCount = arr[0];
+            int trueCount = arr[1];
+            int total = falseCount + trueCount;
+            if (total == 0) {
+                out.put(e.getKey(), 0.0);
+                continue;
+            }
+            double reliability = total / (double) (total + 50);
+            double rate = trueCount / (double) total;
+            out.put(e.getKey(), (rate - overallFloodRate) * reliability);
         }
+        return out;
     }
 
-    private static double polarizationBias(String pol) {
-        if (pol == null) return 0.0;
-        switch (pol.toUpperCase(Locale.ROOT)) {
-            case "VH":
-                return 0.2;
-            case "VV":
-                return 0.05;
-            default:
-                return 0.0;
+    private static void addCount(Map<String, int[]> map, String key, boolean flooding) {
+        int[] arr = map.computeIfAbsent(key, k -> new int[2]);
+        if (flooding) {
+            arr[1]++;
+        } else {
+            arr[0]++;
         }
-    }
-
-    private static double shapeBias(String dominantShape) {
-        if (dominantShape == null || dominantShape.isEmpty()) return 0.0;
-        String lower = dominantShape.toLowerCase(Locale.ROOT);
-        if (lower.contains("elongated")) return 0.1;
-        if (lower.contains("compact")) return 0.05;
-        if (lower.contains("spread")) return 0.02;
-        return 0.0;
     }
 }
 

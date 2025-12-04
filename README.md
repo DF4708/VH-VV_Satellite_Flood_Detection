@@ -29,21 +29,21 @@ When you run the program it performs the full pipeline without any extra scripts
 4. Derives season directly from the `YYYYMMDD` portion embedded in each filename (e.g., `20190118` -> Winter) so seasonal counts and probabilities in `Summary_All.csv` stay aligned with the data.
 5. Writes `Images_All.csv`, `Summary_All.csv`, and `Skipped.csv` to the dataset root. `Summary_All.csv` restores the detailed analytics (group means/medians/modes, effect sizes, weights, XY table) from the earlier pipeline, explicitly excludes `RAW_00000` from statistical equations, and now starts with the former `Summary_Updated_Java` (logistic attribute stats) separated by two blank rows from the remaining sections.
 6. Column guides inside `Summary_All.csv` clarify what `value_a`–`value_d` represent for each section, and the header now exposes explicit columns for baseline, confidence, standard error, CI bounds, and 95% margins where applicable. Categorical weights down-weight tiny/imbalanced samples using a reliability factor `n/(n+50)`.
-7. Generates `Decision_Table_Java.csv` with the same logistic analysis that was previously in `SummaryGeneratorLogistic`, using only the in-memory records—no extra script needed. The standalone `Summary_Updated_Java.csv` is no longer written because its contents are embedded at the top of `Summary_All.csv`.
-8. Generates `Auto_Probabilities.csv`, a lightweight logistic-style probability table (based only on the extracted features) so no external `SummaryGeneratorLogistic` step is needed.
+7. Generates `Decision_Table_Java.csv` with the same logistic analysis that was previously in `SummaryGeneratorLogistic`, using only the in-memory records—no extra script needed. The table now always surfaces the three most confident flood and three most confident non-flood combinations (after the sample and margin filters) so it is never empty. The standalone `Summary_Updated_Java.csv` is no longer written because its contents are embedded at the top of `Summary_All.csv`.
+8. Generates `Auto_Probabilities.csv`, a confidence-weighted probability table that factors in season, polarization, and both shapes with reliability shrinkage and sorts rows from high to low probability.
 
 ## Interpreting the outputs
 
 ### Summary_All.csv
 - The file begins with the `LOGIT_SUMMARY` block (the former `Summary_Updated_Java`), with explicit columns for baseline, confidence_from_n, standard_error, CI bounds, and margin_of_error_95.
-- Two blank rows separate the `LOGIT_SUMMARY` from the downstream sections. The `NOTE` rows at the top restate what `value_a`–`value_d` mean in each section:
+- Two blank rows separate the `LOGIT_SUMMARY` from the downstream sections. Remaining `NOTE` rows restate what `value_a`–`value_d` mean in each section:
   - **STATS**: `value_a` (flood=true metric), `value_b` (flood=false metric), `value_c/value_d` noted per row. Cohen’s *d* is `(mean_true − mean_false) / pooled_std`, where `pooled_std = sqrt(((n1−1)*sd1^2 + (n2−1)*sd2^2) / (n1+n2−2))`. Post-mean rows exclude `RAW_00000` and use 3σ outlier removal.
-  - **SEASONS / SHAPES**: `value_a` true count, `value_b` false count, `value_c` true rate, `value_d` unused.
-  - **WEIGHTS**: numeric weights show Cohen’s *d* alongside overall mean/std/sample counts; categorical weights use a reliability shrink `n/(n+50)` so tiny or imbalanced groups cannot over-dominate.
-  - **XY_TABLE / DECISION_RULE**: `XY_TABLE` includes its own column guide; `DECISION_RULE` note shows the scoring equation.
+  - **SEASONS / SHAPES**: `value_a` total count, `value_b` flooding count, notes include the explicit true/false split.
+  - **WEIGHTS**: numeric weights show Cohen’s *d* alongside overall mean/std/sample counts; categorical weights use a reliability shrink `n/(n+50)` so tiny or imbalanced groups cannot over-dominate and are weighted by representativeness.
+  - **XY_TABLE / DECISION_RULE**: `XY_TABLE` includes its own column guide; `DECISION_RULE` note shows the scoring equation with reliability scaling.
 
 ### Decision_Table_Java.csv
-- Lists only combinations that meet **all** thresholds: samples > 358, margin_of_error_95 ≤ 0.0954 (margin = 1.96 × standard_error, where `standard_error = sqrt(p*(1−p)/n)`), and empirical_flood_rate ≥ 0.5. Columns include the 95% CI bounds and the computed margin_of_error_95 so you can verify the filter directly.
+- Lists only combinations that meet **all** thresholds: samples > 358, margin_of_error_95 ≤ 0.0954 (margin = 1.96 × standard_error, where `standard_error = sqrt(p*(1−p)/n)`), and sorts to surface the three strongest flood and three strongest non-flood predictions by confidence. Columns include the 95% CI bounds and the computed margin_of_error_95 so you can verify the filter directly; if strict filters yield nothing, the most confident six combinations are still emitted as fallbacks.
 
 ### Auto_Probabilities.csv
-- Uses a lightweight score: `score = z_raw_mean + 0.6*norm_black_diameter + 0.6*norm_white_diameter + season_bias + polarization_bias + shape_bias`; `probability = 1/(1+exp(−score))`. Here, `z_raw_mean` is z-scored against the dataset mean/std, diameters are normalized to their respective maxima, and the bias terms add small boosts/penalties based on season, polarization, and dominant shape.
+- Uses a reliability-aware score: `score = z_raw_mean + 0.6*norm_black_diameter + 0.6*norm_white_diameter + w_season + w_pol + w_black_shape + w_white_shape`, where each categorical weight is `(rate − overall_rate) * n/(n+50)`. `probability = 1/(1+exp(−score))`. `z_raw_mean` is z-scored against the dataset mean/std, diameters are normalized to their respective maxima, and rows are sorted from highest to lowest probability.
