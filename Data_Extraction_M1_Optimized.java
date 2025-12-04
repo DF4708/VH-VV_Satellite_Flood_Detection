@@ -2233,8 +2233,23 @@ public class Data_Extraction_M1_Optimized {
                     "notes"
             ));
 
-            combos.sort(Comparator.comparing((DecisionCombo dc) -> dc.empiricalFloodRate).reversed()
-                    .thenComparing(dc -> dc.marginOfError95));
+            Map<String, Integer> confidenceRank = new HashMap<>();
+            confidenceRank.put("High", 5);
+            confidenceRank.put("Medium", 4);
+            confidenceRank.put("Low", 3);
+            confidenceRank.put("Very Low", 2);
+            confidenceRank.put("Extremely Low", 1);
+
+            combos.sort((a, b) -> {
+                int rankA = confidenceRank.getOrDefault(a.confidenceFromN, 0);
+                int rankB = confidenceRank.getOrDefault(b.confidenceFromN, 0);
+                if (rankA != rankB) {
+                    return Integer.compare(rankB, rankA); // higher confidence first
+                }
+                int cmpProb = Double.compare(b.empiricalFloodRate, a.empiricalFloodRate);
+                if (cmpProb != 0) return cmpProb;
+                return Double.compare(a.marginOfError95, b.marginOfError95);
+            });
 
             for (DecisionCombo dc : combos) {
                 String note = dc.unstableExtremeFlag
@@ -2315,7 +2330,9 @@ public class Data_Extraction_M1_Optimized {
         Path autoPath = rootFolder.resolve("Auto_Probabilities.csv");
 
         try (BufferedWriter writer = Files.newBufferedWriter(autoPath, StandardCharsets.UTF_8)) {
-            writer.write("# score = confidence_adjusted(w_raw*z_raw_mean + w_bd*z_black_diameter + w_wd*z_white_diameter + w_season + w_pol + w_black_shape + w_white_shape); probability = logistic(score); probability is the confidence-weighted chance that the image is flooded given the observed attributes.");
+            writer.write("# score = confidence_adjusted(w_raw*z_raw_mean + w_bd*z_black_diameter + w_wd*z_white_diameter + w_season + w_pol + w_black_shape + w_white_shape)");
+            writer.newLine();
+            writer.write("# probability = logistic(score); probability reflects the confidence-weighted chance that the image is flooded given the observed attributes");
             writer.newLine();
             writer.write("image_name,folder_name,polarization,season,black_shape,white_shape,label_flooding,score,probability");
             writer.newLine();
