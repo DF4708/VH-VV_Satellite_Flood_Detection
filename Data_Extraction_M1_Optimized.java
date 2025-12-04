@@ -4,7 +4,6 @@ import java.awt.image.DataBuffer;
 
 import java.io.BufferedWriter;
 import java.io.IOException;
-import java.io.File;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
@@ -25,7 +24,7 @@ import java.util.concurrent.*;
  *       * All numeric subfolders under the root path (e.g., 0001, 33, 120).
  *       * The root folder itself (for test TIFFs).
  *   - Builds a job list of all .tif/.tiff images, then processes them in parallel
- *     with a fixed thread pool (tuned for Apple M1 Max: 8 threads).
+ *     with a fixed thread pool (optimized for Apple M1 Max: 8 threads).
  *   - For each image:
  *       * Finds the flood flag by matching base name against JSON filenames.
  *       * Derives polarization ("VV", "VH", or "OTHER").
@@ -49,8 +48,10 @@ import java.util.concurrent.*;
  *            - RAW_XXXXX counts for all RAW values that appear in the dataset.
  *
  *       2) Summary_All.csv
- *          High-level data quality and distribution summary:
- *            - COUNTS  : total image counts by polarization, by flooding.
+ *          One CSV with multiple "sections" (one header):
+ *            - STATS   : group stats on raw_mean (pre-mean and post-mean, std, median,
+ *                        and post-mode based on RAW pixel counts, not raw_mean values).
+ *                        Mode ignores RAW values whose aggregate pixel count is 0 and RAW_00000.
  *            - SEASONS : season counts and true_rates
  *            - SHAPES  : shape counts by flooding
  *            - WEIGHTS : weights for raw_mean, black_diameter, white_diameter,
@@ -69,53 +70,19 @@ public class Data_Extraction_M1_Optimized {
 
     // ---------- Helper types ----------
 
-    private static class Component {
-        int minX, maxX, minY, maxY;
-        int pixelCount;
-
-        Component() {
-            minX = Integer.MAX_VALUE;
-            maxX = Integer.MIN_VALUE;
-            minY = Integer.MAX_VALUE;
-            maxY = Integer.MIN_VALUE;
-            pixelCount = 0;
-        }
-
-        void update(int x, int y) {
-            if (x < minX) minX = x;
-            if (x > maxX) maxX = x;
-            if (y < minY) minY = y;
-            if (y > maxY) maxY = y;
-            pixelCount++;
-        }
-
-        int getWidth() {
-            return (pixelCount == 0) ? 0 : (maxX - minX + 1);
-        }
-
-        int getHeight() {
-            return (pixelCount == 0) ? 0 : (maxY - minY + 1);
-        }
-
-        double getDiameter() {
-            if (pixelCount == 0) return 0.0;
-            int dx = maxX - minX;
-            int dy = maxY - minY;
-            return Math.sqrt((double) dx * dx + (double) dy * dy);
-        }
+    private static class ComponentStats {
+        int size;
+        int width;
+        int height;
+        double diameter;
+        String shape;
     }
 
     private static class ImageAnalysis {
-        double rawMean;
-        String blackShape;
-        int blackWidth;
-        int blackHeight;
-        double blackDiameter;
-        String whiteShape;
-        int whiteWidth;
-        int whiteHeight;
-        double whiteDiameter;
         Map<String, Integer> rawCounts;
+        double rawMean;
+        ComponentStats blackStats;
+        ComponentStats whiteStats;
         String dominantShape;
     }
 
@@ -131,19 +98,15 @@ public class Data_Extraction_M1_Optimized {
     private static class ImageRecord {
         String imageName;
         String folderName;
+        String polarization;
         boolean flooding;
         String season;
-        String polarization;
         double rawMean;
-        String blackShape;
-        int blackWidth;
-        int blackHeight;
-        double blackDiameter;
-        String whiteShape;
-        int whiteWidth;
-        int whiteHeight;
-        double whiteDiameter;
+
+        ComponentStats blackStats;
+        ComponentStats whiteStats;
         String dominantShape;
+
         Map<String, Integer> rawCounts;
     }
 
@@ -151,7 +114,6 @@ public class Data_Extraction_M1_Optimized {
         String imageName;
         String folderName;
         String reason;
-
         SkipRecord(String imageName, String folderName, String reason) {
             this.imageName = imageName;
             this.folderName = folderName;
@@ -160,16 +122,26 @@ public class Data_Extraction_M1_Optimized {
     }
 
     private static class JobResult {
-        ImageRecord record;
-        SkipRecord skip;
-
+        final ImageRecord record;
+        final SkipRecord skip;
         JobResult(ImageRecord record, SkipRecord skip) {
             this.record = record;
             this.skip = skip;
         }
     }
 
-    // ---------- Main entry point ----------
+    private static class WeightContext {
+        double overallTrueRate;
+        double wRaw, meanRawAll, stdRawAll;
+        double wBd, meanBdAll, stdBdAll;
+        double wWd, meanWdAll, stdWdAll;
+        Map<String, Double> seasonWeight = new HashMap<>();
+        Map<String, Double> polWeight = new HashMap<>();
+        Map<String, Double> blackShapeWeight = new HashMap<>();
+        Map<String, Double> whiteShapeWeight = new HashMap<>();
+    }
+
+    // ---------- MAIN ----------
 
     public static void main(String[] args) {
         Path rootFolder = (args.length > 0)
@@ -177,11 +149,6 @@ public class Data_Extraction_M1_Optimized {
                 : Paths.get("").toAbsolutePath();
 
         System.out.println("[INFO] Root folder: " + rootFolder);
-
-        // Clean directory tree (integrated former Data_Cleaner)
-        System.out.println("[INFO] Cleaning directory tree...");
-        cleanDirectory(rootFolder.toFile());
-        System.out.println("[INFO] Cleaning complete.");
 
         Path s1JsonPath = rootFolder.resolve("S1list.json");
         Path s2JsonPath = rootFolder.resolve("S2list.json");
@@ -222,7 +189,7 @@ public class Data_Extraction_M1_Optimized {
             futures.add(pool.submit(new Callable<JobResult>() {
                 @Override
                 public JobResult call() {
-                    return processImageJob(job, floodBySentinelName);
+                    return processSingleImage(job, floodBySentinelName);
                 }
             }));
         }
@@ -256,9 +223,10 @@ public class Data_Extraction_M1_Optimized {
                 System.out.printf("\r[PROGRESS] Processed %d / %d images (%.1f%%)", processedJobs, totalJobs, pct);
             }
         }
-        System.out.println();
-        System.out.println("[INFO] Image processing complete.");
-        System.out.println("[INFO] Records: " + records.size() + ", Skipped: " + skips.size());
+        System.out.println(); // end progress line
+
+        System.out.println("[INFO] Images successfully processed: " + records.size());
+        System.out.println("[INFO] Images skipped: " + skips.size());
 
         if (records.isEmpty()) {
             System.out.println("[WARN] No images produced data rows. Check labels and TIFF formats.");
@@ -306,32 +274,6 @@ public class Data_Extraction_M1_Optimized {
         }
     }
 
-    // ----------
-    // ---------- Cleaning (formerly Data_Cleaner) ----------
-    // ----------
-
-    private static void cleanDirectory(File folder) {
-        File[] files = folder.listFiles();
-        if (files == null) return;
-
-        for (File file : files) {
-            if (file.isDirectory()) {
-                cleanDirectory(file);
-                continue;
-            }
-
-            String name = file.getName();
-            boolean valid =
-                    name.endsWith("VV.tif") || name.endsWith("VH.tif") ||
-                            name.endsWith(".java")  || name.endsWith(".json");
-
-            if (!valid) {
-                // best-effort delete; ignore failure
-                file.delete();
-            }
-        }
-    }
-
     // ---------- Job gathering ----------
 
     private static int gatherJobs(Path rootFolder, List<ImageJob> jobs) {
@@ -347,118 +289,51 @@ public class Data_Extraction_M1_Optimized {
                 }
             }
         } catch (IOException e) {
-            System.err.println("[WARN] Failed to scan subfolders: " + e.getMessage());
+            System.err.println("[WARN] Could not list root directory: " + e.getMessage());
         }
 
-        // Also process any TIF/TIFF in the root folder.
-        count += gatherJobsInFolder(rootFolder, "", jobs);
+        // Root folder itself (folderName = "ROOT").
+        count += gatherJobsInFolder(rootFolder, "ROOT", jobs);
 
         return count;
     }
 
-    private static int gatherJobsInFolder(Path folder, String folderName, List<ImageJob> jobs) {
+    private static int gatherJobsInFolder(Path folderPath, String folderName, List<ImageJob> jobs) {
         int count = 0;
-
-        try (DirectoryStream<Path> ds = Files.newDirectoryStream(folder)) {
+        try (DirectoryStream<Path> ds = Files.newDirectoryStream(folderPath)) {
             for (Path entry : ds) {
-                if (Files.isRegularFile(entry)) {
-                    String name = entry.getFileName().toString().toLowerCase(Locale.ROOT);
-                    if (name.endsWith(".tif") || name.endsWith(".tiff")) {
-                        jobs.add(new ImageJob(entry, folderName));
-                        count++;
-                    }
+                if (Files.isDirectory(entry)) continue;
+                String fileName = entry.getFileName().toString();
+                String lower = fileName.toLowerCase();
+                if (lower.endsWith(".tif") || lower.endsWith(".tiff")) {
+                    jobs.add(new ImageJob(entry, folderName));
+                    count++;
                 }
             }
         } catch (IOException e) {
-            System.err.println("[WARN] Failed to list files in " + folder + ": " + e.getMessage());
+            System.err.println("[WARN] Could not list folder " + folderPath + ": " + e.getMessage());
         }
-
         return count;
     }
 
-    // ---------- JSON parsing ----------
+    // ---------- Per-image processing ----------
 
-    private static void parseFloodJsonFile(Path jsonPath, Map<String, Boolean> floodBySentinelName) throws IOException {
-        System.out.println("[INFO] Parsing JSON labels from: " + jsonPath);
-
-        String json = Files.readString(jsonPath, StandardCharsets.UTF_8);
-
-        int index = 0;
-        while (true) {
-            int filenamePos = json.indexOf("\"filename\"", index);
-            if (filenamePos < 0) {
-                break;
-            }
-
-            int colonPos = json.indexOf(':', filenamePos);
-            if (colonPos < 0) break;
-
-            int quoteStart = json.indexOf('"', colonPos + 1);
-            if (quoteStart < 0) break;
-            int quoteEnd = json.indexOf('"', quoteStart + 1);
-            if (quoteEnd < 0) break;
-
-            String filename = json.substring(quoteStart + 1, quoteEnd).trim();
-            String baseName = stripExtension(filename);
-
-            int windowStart = Math.max(0, filenamePos - 2000);
-            String window = json.substring(windowStart, filenamePos);
-
-            Boolean floodingValue = locateFloodingValue(window);
-            if (floodingValue != null) {
-                floodBySentinelName.put(baseName, floodingValue);
-            }
-
-            index = quoteEnd + 1;
-        }
-
-        System.out.println("[INFO] Parsed " + floodBySentinelName.size() + " labeled entries from " + jsonPath.getFileName());
-    }
-
-    private static Boolean locateFloodingValue(String window) {
-        int floodingPos = window.lastIndexOf("\"FLOODING\"");
-        if (floodingPos < 0) return null;
-
-        int colonPos = window.indexOf(':', floodingPos);
-        if (colonPos < 0) return null;
-
-        String tail = window.substring(colonPos + 1).toLowerCase(Locale.ROOT);
-
-        if (tail.contains("true")) {
-            return Boolean.TRUE;
-        }
-        if (tail.contains("false")) {
-            return Boolean.FALSE;
-        }
-
-        return null;
-    }
-
-    private static String stripExtension(String filename) {
-        int dot = filename.lastIndexOf('.');
-        if (dot < 0) return filename;
-        return filename.substring(0, dot);
-    }
-
-    // ---------- Image job processing ----------
-
-    private static JobResult processImageJob(ImageJob job, Map<String, Boolean> floodBySentinelName) {
+    private static JobResult processSingleImage(
+            ImageJob job,
+            Map<String, Boolean> floodBySentinelName
+    ) {
         Path imagePath = job.imagePath;
         String folderName = job.folderName;
         String fileName = imagePath.getFileName().toString();
-        String baseName = stripExtension(fileName);
 
-        Boolean floodFlag = null;
-        for (Map.Entry<String, Boolean> e : floodBySentinelName.entrySet()) {
-            String key = e.getKey();
-            if (baseName.contains(key)) {
-                floodFlag = e.getValue();
-                break;
-            }
-        }
+        String baseName = stripExtension(fileName);
+        Boolean floodFlag = findFloodFlagForImage(baseName, floodBySentinelName);
 
         if (floodFlag == null) {
-            return new JobResult(null, new SkipRecord(fileName, folderName, "No matching FLOODING label in JSON."));
+            return new JobResult(
+                    null,
+                    new SkipRecord(fileName, folderName, "No matching FLOODING label in S1list/S2list")
+            );
         }
 
         BufferedImage image;
@@ -467,7 +342,8 @@ public class Data_Extraction_M1_Optimized {
         } catch (IOException e) {
             return new JobResult(
                     null,
-                    new SkipRecord(fileName, folderName, "Failed to read image: " + e.getMessage())
+                    new SkipRecord(fileName, folderName,
+                            "Failed to read image (TIFF decoding error). Consider external pre-conversion.")
             );
         }
 
@@ -488,51 +364,94 @@ public class Data_Extraction_M1_Optimized {
         record.season = inferSeasonFromFilename(fileName);
         if (record.season == null) record.season = "";
 
-        String polarization = inferPolarizationFromFilename(fileName);
-        record.polarization = (polarization != null) ? polarization : "";
+        if (fileName.contains("VV")) {
+            record.polarization = "VV";
+        } else if (fileName.contains("VH")) {
+            record.polarization = "VH";
+        } else {
+            record.polarization = "OTHER";
+        }
 
         record.rawMean = analysis.rawMean;
-        record.blackShape = analysis.blackShape;
-        record.blackWidth = analysis.blackWidth;
-        record.blackHeight = analysis.blackHeight;
-        record.blackDiameter = analysis.blackDiameter;
-        record.whiteShape = analysis.whiteShape;
-        record.whiteWidth = analysis.whiteWidth;
-        record.whiteHeight = analysis.whiteHeight;
-        record.whiteDiameter = analysis.whiteDiameter;
+        record.blackStats = analysis.blackStats;
+        record.whiteStats = analysis.whiteStats;
         record.dominantShape = analysis.dominantShape;
         record.rawCounts = analysis.rawCounts;
 
         return new JobResult(record, null);
     }
 
-    private static String inferSeasonFromFilename(String filename) {
-        String digits = filename.replaceAll("\\D+", "");
-        if (digits.length() < 8) return null;
+    // ---------- JSON label parsing ----------
 
-        String yyyymmdd = digits.substring(0, 8);
-        int month;
-        try {
-            month = Integer.parseInt(yyyymmdd.substring(4, 6));
-        } catch (NumberFormatException e) {
-            return null;
+    private static String stripExtension(String fileName) {
+        int dot = fileName.lastIndexOf('.');
+        if (dot < 0) return fileName;
+        return fileName.substring(0, dot);
+    }
+
+    private static Boolean findFloodFlagForImage(
+            String imageBaseName,
+            Map<String, Boolean> floodBySentinelName
+    ) {
+        for (Map.Entry<String, Boolean> entry : floodBySentinelName.entrySet()) {
+            String sentinelName = entry.getKey();
+            if (imageBaseName.contains(sentinelName)) {
+                return entry.getValue();
+            }
+        }
+        return null;
+    }
+
+    private static void parseFloodJsonFile(
+            Path jsonPath,
+            Map<String, Boolean> floodBySentinelName
+    ) throws IOException {
+        String json = Files.readString(jsonPath, StandardCharsets.UTF_8);
+
+        int searchIndex = 0;
+        while (true) {
+            int filenameKeyIndex = json.indexOf("\"filename\"", searchIndex);
+            if (filenameKeyIndex < 0) break;
+
+            int colonIndex = json.indexOf(':', filenameKeyIndex);
+            if (colonIndex < 0) break;
+
+            int firstQuote = json.indexOf('"', colonIndex + 1);
+            int secondQuote = json.indexOf('"', firstQuote + 1);
+            if (firstQuote < 0 || secondQuote < 0) break;
+
+            String fullFilename = json.substring(firstQuote + 1, secondQuote).trim();
+            String baseName = fullFilename;
+            int dot = baseName.lastIndexOf('.');
+            if (dot >= 0) baseName = baseName.substring(0, dot);
+
+            int windowStart = Math.max(0, filenameKeyIndex - 300);
+            int floodingIndex = json.lastIndexOf("\"FLOODING\"", filenameKeyIndex);
+            if (floodingIndex < windowStart) floodingIndex = -1;
+
+            boolean flooding = false;
+            if (floodingIndex >= 0) {
+                int colonFlood = json.indexOf(':', floodingIndex);
+                if (colonFlood > 0) {
+                    int trueIndex = json.indexOf("true", colonFlood);
+                    int falseIndex = json.indexOf("false", colonFlood);
+                    if (trueIndex > 0 && trueIndex < secondQuote &&
+                            (falseIndex < 0 || trueIndex < falseIndex)) {
+                        flooding = true;
+                    } else if (falseIndex > 0 && falseIndex < secondQuote) {
+                        flooding = false;
+                    }
+                }
+            }
+
+            floodBySentinelName.put(baseName, flooding);
+            searchIndex = secondQuote + 1;
         }
 
-        if (month == 12 || month <= 2) return "Winter";
-        if (month <= 5) return "Spring";
-        if (month <= 8) return "Summer";
-        if (month <= 11) return "Fall";
-        return null;
+        System.out.println("[INFO] Parsed flood labels from " + jsonPath.getFileName());
     }
 
-    private static String inferPolarizationFromFilename(String filename) {
-        String upper = filename.toUpperCase(Locale.ROOT);
-        if (upper.contains("_VV")) return "VV";
-        if (upper.contains("_VH")) return "VH";
-        return null;
-    }
-
-    // ---------- Image analysis (per image) ----------
+    // ---------- Per-image analysis: RAW histogram + shapes (non-overlap + two-pass + fallback) ----------
 
     private static ImageAnalysis analyzeImage(BufferedImage image) {
         Raster raster = image.getRaster();
@@ -593,135 +512,61 @@ public class Data_Extraction_M1_Optimized {
         for (int y = 0; y < height; y++) {
             boolean[] blackRow = blackMask[y];
             boolean[] whiteRow = whiteMask[y];
-
             for (int x = 0; x < width; x++) {
                 int raw = sampleRaw(raster, bands, maxSample, x, y);
                 String key = String.format("RAW_%05d", raw);
-                int old = rawCounts.getOrDefault(key, 0);
-                rawCounts.put(key, old + 1);
+                rawCounts.put(key, rawCounts.getOrDefault(key, 0) + 1);
 
-                boolean isBlack = darkSet.contains(raw);
-                boolean isWhite = brightSet.contains(raw);
+                if (darkSet.contains(raw))  blackRow[x] = true;
+                if (brightSet.contains(raw)) whiteRow[x] = true;
+            }
+        }
 
-                if (isBlack && !isWhite) {
-                    blackRow[x] = true;
-                } else if (isWhite && !isBlack) {
-                    whiteRow[x] = true;
-                } else {
-                    blackRow[x] = false;
-                    whiteRow[x] = false;
+        // First pick white component; enforce area/density thresholds (non-overlap logic).
+        ComponentStats whiteStats = largestComponentStats(
+                whiteMask, width, height, true);
+
+        // Remove white area from black mask to ensure no overlap.
+        if (whiteStats != null && whiteStats.size > 0) {
+            for (int y = 0; y < height; y++) {
+                boolean[] bRow = blackMask[y];
+                boolean[] wRow = whiteMask[y];
+                for (int x = 0; x < width; x++) {
+                    if (wRow[x]) bRow[x] = false;
                 }
             }
         }
 
-        Component blackComponent = findLargestComponent(blackMask);
-        Component whiteComponent = findLargestComponent(whiteMask);
+        ComponentStats blackStats = largestComponentStats(
+                blackMask, width, height, false);
 
-        if (blackComponent.pixelCount == 0 && whiteComponent.pixelCount > 0) {
-            blackComponent.minX = whiteComponent.minX;
-            blackComponent.maxX = whiteComponent.maxX;
-            blackComponent.minY = whiteComponent.minY;
-            blackComponent.maxY = whiteComponent.maxY;
-            blackComponent.pixelCount = whiteComponent.pixelCount;
-        } else if (whiteComponent.pixelCount == 0 && blackComponent.pixelCount > 0) {
-            whiteComponent.minX = blackComponent.minX;
-            whiteComponent.maxX = blackComponent.maxX;
-            whiteComponent.minY = blackComponent.minY;
-            whiteComponent.maxY = blackComponent.maxY;
-            whiteComponent.pixelCount = blackComponent.pixelCount;
-        } else if (blackComponent.pixelCount == 0 && whiteComponent.pixelCount == 0) {
-            blackComponent.minX = 0;
-            blackComponent.maxX = Math.max(0, width - 1);
-            blackComponent.minY = 0;
-            blackComponent.maxY = Math.max(0, height - 1);
-            blackComponent.pixelCount = width * height;
+        if (whiteStats == null) whiteStats = emptyStats();
+        if (blackStats == null) blackStats = emptyStats();
 
-            whiteComponent.minX = 0;
-            whiteComponent.maxX = Math.max(0, width - 1);
-            whiteComponent.minY = 0;
-            whiteComponent.maxY = Math.max(0, height - 1);
-            whiteComponent.pixelCount = width * height;
+        String dominantShape;
+        if (blackStats.size >= whiteStats.size) {
+            dominantShape = blackStats.shape;
+        } else {
+            dominantShape = whiteStats.shape;
         }
 
-        int halfWidth = width / 2;
-        int halfHeight = height / 2;
+        ImageAnalysis result = new ImageAnalysis();
+        result.rawCounts = rawCounts;
+        result.rawMean = rawMean;
+        result.blackStats = blackStats;
+        result.whiteStats = whiteStats;
+        result.dominantShape = dominantShape;
+        return result;
+    }
 
-        Component blackAdjusted = new Component();
-        Component whiteAdjusted = new Component();
-
-        for (int y = 0; y < height; y++) {
-            boolean[] blackRow = blackMask[y];
-            boolean[] whiteRow = whiteMask[y];
-
-            for (int x = 0; x < width; x++) {
-                boolean isBlack = blackRow[x];
-                boolean isWhite = whiteRow[x];
-
-                boolean blackAllowed =
-                        !(x > halfWidth && y < halfHeight) &&
-                                !(x > halfWidth && y > halfHeight);
-                boolean whiteAllowed =
-                        !(x < halfWidth && y < halfHeight) &&
-                                !(x < halfWidth && y > halfHeight);
-
-                if (isBlack && blackAllowed && !isWhite) {
-                    blackAdjusted.update(x, y);
-                }
-                if (isWhite && whiteAllowed && !isBlack) {
-                    whiteAdjusted.update(x, y);
-                }
-            }
-        }
-
-        if (blackAdjusted.pixelCount > 0) {
-            blackComponent = blackAdjusted;
-        }
-        if (whiteAdjusted.pixelCount > 0) {
-            whiteComponent = whiteAdjusted;
-        }
-
-        String blackShape = classifyShape(blackComponent);
-        String whiteShape = classifyShape(whiteComponent);
-
-        List<Map.Entry<String, Integer>> sortedRaw = new ArrayList<>(rawCounts.entrySet());
-        sortedRaw.sort(new Comparator<Map.Entry<String, Integer>>() {
-            @Override
-            public int compare(Map.Entry<String, Integer> a, Map.Entry<String, Integer> b) {
-                return Integer.compare(b.getValue(), a.getValue());
-            }
-        });
-
-        String dominantShape = "none";
-        if (!sortedRaw.isEmpty()) {
-            String firstKey = sortedRaw.get(0).getKey();
-            try {
-                int dominantRaw = Integer.parseInt(firstKey.substring(4));
-                if (darkSet.contains(dominantRaw) && !brightSet.contains(dominantRaw)) {
-                    dominantShape = "black";
-                } else if (brightSet.contains(dominantRaw) && !darkSet.contains(dominantRaw)) {
-                    dominantShape = "white";
-                } else {
-                    dominantShape = "mixed";
-                }
-            } catch (NumberFormatException e) {
-                dominantShape = "mixed";
-            }
-        }
-
-        ImageAnalysis analysis = new ImageAnalysis();
-        analysis.rawMean = rawMean;
-        analysis.blackShape = blackShape;
-        analysis.blackWidth = blackComponent.getWidth();
-        analysis.blackHeight = blackComponent.getHeight();
-        analysis.blackDiameter = blackComponent.getDiameter();
-        analysis.whiteShape = whiteShape;
-        analysis.whiteWidth = whiteComponent.getWidth();
-        analysis.whiteHeight = whiteComponent.getHeight();
-        analysis.whiteDiameter = whiteComponent.getDiameter();
-        analysis.rawCounts = rawCounts;
-        analysis.dominantShape = dominantShape;
-
-        return analysis;
+    private static ComponentStats emptyStats() {
+        ComponentStats cs = new ComponentStats();
+        cs.size = 0;
+        cs.width = 0;
+        cs.height = 0;
+        cs.diameter = 0.0;
+        cs.shape = "none";
+        return cs;
     }
 
     private static int sampleRaw(Raster raster, int bands, int maxSample, int x, int y) {
@@ -741,47 +586,127 @@ public class Data_Extraction_M1_Optimized {
         return raw;
     }
 
-    private static Component findLargestComponent(boolean[][] mask) {
+    // ---------- Connected components with two-pass thresholds + fallback ----------
+
+    private static ComponentStats largestComponentStats(
+            boolean[][] mask,
+            int imageWidth,
+            int imageHeight,
+            boolean isWhite
+    ) {
+        // Pass 1: strict (avoid huge, low-density blobs)
+        ComponentStats strict = largestComponentStatsWithThresholds(
+                mask,
+                imageWidth,
+                imageHeight,
+                0.40,   // max 40% of full image area
+                0.10,   // at least 10% of bounding box filled
+                20      // min 20 pixels
+        );
+        if (strict != null) {
+            return strict;
+        }
+
+        // Pass 2: relaxed (allow more shapes but still avoid almost-full-image blobs)
+        ComponentStats relaxed = largestComponentStatsWithThresholds(
+                mask,
+                imageWidth,
+                imageHeight,
+                0.95,   // max 95% of full image area
+                0.001,  // at least 0.1% of bounding box filled (more tolerant)
+                20      // min 20 pixels
+        );
+        if (relaxed != null) {
+            return relaxed;
+        }
+
+        // Fallback: pick largest connected component with only a minimum-size threshold.
+        ComponentStats fallback = largestComponentStatsNoFilter(mask, imageWidth, imageHeight, 20);
+        if (fallback != null) {
+            return fallback;
+        }
+
+        // If nothing at all is found, return empty stats.
+        return emptyStats();
+    }
+
+    private static ComponentStats largestComponentStatsWithThresholds(
+            boolean[][] mask,
+            int imageWidth,
+            int imageHeight,
+            double maxAreaRatio,
+            double minFillRatio,
+            int minSize
+    ) {
         int height = mask.length;
-        int width = (height > 0) ? mask[0].length : 0;
+        if (height == 0) return null;
+        int width = mask[0].length;
 
         boolean[][] visited = new boolean[height][width];
-        Component best = new Component();
 
-        int[] dx = { 1, -1, 0, 0 };
-        int[] dy = { 0, 0, 1, -1 };
+        ComponentStats best = null;
+        int[] dX = {1, -1, 0, 0};
+        int[] dY = {0, 0, 1, -1};
+
+        double imageArea = (double) imageWidth * (double) imageHeight;
 
         for (int y = 0; y < height; y++) {
             for (int x = 0; x < width; x++) {
                 if (!mask[y][x] || visited[y][x]) continue;
 
-                Component comp = new Component();
-                Deque<int[]> stack = new ArrayDeque<>();
-                stack.push(new int[]{ x, y });
+                int minX = x, maxX = x;
+                int minY = y, maxY = y;
+                int size = 0;
+
+                Deque<int[]> queue = new ArrayDeque<>();
+                queue.add(new int[]{x, y});
                 visited[y][x] = true;
 
-                while (!stack.isEmpty()) {
-                    int[] p = stack.pop();
-                    int cx = p[0];
-                    int cy = p[1];
+                while (!queue.isEmpty()) {
+                    int[] p = queue.removeFirst();
+                    int px = p[0], py = p[1];
+                    size++;
 
-                    comp.update(cx, cy);
+                    if (px < minX) minX = px;
+                    if (px > maxX) maxX = px;
+                    if (py < minY) minY = py;
+                    if (py > maxY) maxY = py;
 
                     for (int k = 0; k < 4; k++) {
-                        int nx = cx + dx[k];
-                        int ny = cy + dy[k];
-
+                        int nx = px + dX[k];
+                        int ny = py + dY[k];
                         if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
-                        if (visited[ny][nx]) continue;
-                        if (!mask[ny][nx]) continue;
-
+                        if (!mask[ny][nx] || visited[ny][nx]) continue;
                         visited[ny][nx] = true;
-                        stack.push(new int[]{ nx, ny });
+                        queue.addLast(new int[]{nx, ny});
                     }
                 }
 
-                if (comp.pixelCount > best.pixelCount) {
-                    best = comp;
+                if (size < minSize) continue; // too small to be meaningful
+
+                int compWidth = maxX - minX + 1;
+                int compHeight = maxY - minY + 1;
+                double boxArea = (double) compWidth * (double) compHeight;
+
+                double areaRatio = boxArea / imageArea;
+                double fillRatio = (boxArea > 0.0) ? ((double) size / boxArea) : 0.0;
+
+                if (areaRatio > maxAreaRatio) continue;    // too big (covers too much of image)
+                if (fillRatio < minFillRatio) continue;    // too sparse / outline-like
+
+                double diameter = Math.sqrt(
+                        (double) compWidth * compWidth +
+                                (double) compHeight * compHeight
+                );
+
+                if (best == null || size > best.size) {
+                    ComponentStats cs = new ComponentStats();
+                    cs.size = size;
+                    cs.width = compWidth;
+                    cs.height = compHeight;
+                    cs.diameter = diameter;
+                    cs.shape = classifyShape(size, compWidth, compHeight);
+                    best = cs;
                 }
             }
         }
@@ -789,64 +714,202 @@ public class Data_Extraction_M1_Optimized {
         return best;
     }
 
-    private static String classifyShape(Component comp) {
-        if (comp.pixelCount == 0) return "none";
+    /**
+     * Fallback connected-component search:
+     * no area/fill ratio thresholds, only a minimum size.
+     * Ensures that if any contiguous region exists, we return it
+     * instead of reporting "none".
+     */
+    private static ComponentStats largestComponentStatsNoFilter(
+            boolean[][] mask,
+            int imageWidth,
+            int imageHeight,
+            int minSize
+    ) {
+        int height = mask.length;
+        if (height == 0) return null;
+        int width = mask[0].length;
 
-        int width = comp.getWidth();
-        int height = comp.getHeight();
-        if (width <= 0 || height <= 0) return "none";
+        boolean[][] visited = new boolean[height][width];
 
-        double aspect = (double) width / (double) height;
-        if (aspect < 1.0) aspect = 1.0 / aspect;
+        ComponentStats best = null;
+        int[] dX = {1, -1, 0, 0};
+        int[] dY = {0, 0, 1, -1};
 
-        double fillRatio = (double) comp.pixelCount / (double) (width * height);
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                if (!mask[y][x] || visited[y][x]) continue;
 
-        if (fillRatio > 0.75 && aspect < 1.2) {
-            return "square";
+                int minX = x, maxX = x;
+                int minY = y, maxY = y;
+                int size = 0;
+
+                Deque<int[]> queue = new ArrayDeque<>();
+                queue.add(new int[]{x, y});
+                visited[y][x] = true;
+
+                while (!queue.isEmpty()) {
+                    int[] p = queue.removeFirst();
+                    int px = p[0], py = p[1];
+                    size++;
+
+                    if (px < minX) minX = px;
+                    if (px > maxX) maxX = px;
+                    if (py < minY) minY = py;
+                    if (py > maxY) maxY = py;
+
+                    for (int k = 0; k < 4; k++) {
+                        int nx = px + dX[k];
+                        int ny = py + dY[k];
+                        if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
+                        if (!mask[ny][nx] || visited[ny][nx]) continue;
+                        visited[ny][nx] = true;
+                        queue.addLast(new int[]{nx, ny});
+                    }
+                }
+
+                if (size < minSize) continue;
+
+                int compWidth = maxX - minX + 1;
+                int compHeight = maxY - minY + 1;
+
+                double diameter = Math.sqrt(
+                        (double) compWidth * compWidth +
+                                (double) compHeight * compHeight
+                );
+
+                if (best == null || size > best.size) {
+                    ComponentStats cs = new ComponentStats();
+                    cs.size = size;
+                    cs.width = compWidth;
+                    cs.height = compHeight;
+                    cs.diameter = diameter;
+                    cs.shape = classifyShape(size, compWidth, compHeight);
+                    best = cs;
+                }
+            }
         }
-        if (fillRatio > 0.75 && aspect >= 1.2 && aspect < 3.0) {
-            return "rectangle";
-        }
-        if (fillRatio > 0.6 && aspect < 1.2) {
-            return "circle";
-        }
-        if (fillRatio > 0.5 && aspect >= 1.2 && aspect < 2.5) {
-            return "ellipse";
-        }
-        if (fillRatio > 0.4 && aspect >= 2.5) {
-            return "parallelogram";
-        }
-        if (fillRatio > 0.3 && aspect >= 3.0) {
-            return "trapezium";
-        }
-        if (fillRatio > 0.2) {
-            return "triangle";
-        }
-        return "crescent";
+
+        return best;
     }
 
-    // ---------- CSV builders ----------
+    /**
+     * Shape heuristic:
+     * - Circle only for very compact, nearly square components.
+     * - Others: square, ellipse, rectangle, parallelogram, trapezium, triangle, crescent.
+     */
+    private static String classifyShape(int size, int width, int height) {
+        if (size <= 0 || width <= 0 || height <= 0) return "none";
 
-    private static List<List<String>> buildImagesAllRows(List<ImageRecord> records, Set<String> allRawCodes) {
+        int areaBox = width * height;
+        double fillRatio = (areaBox > 0) ? ((double) size / (double) areaBox) : 0.0;
+        double aspect = (width >= height)
+                ? (double) width / (double) height
+                : (double) height / (double) width;
+
+        if (fillRatio >= 0.80 && aspect <= 1.05) {
+            return "circle";
+        }
+        if (fillRatio >= 0.65 && aspect <= 1.15) {
+            return "square";
+        }
+        if (fillRatio >= 0.55 && aspect <= 1.6) {
+            return "ellipse";
+        }
+        if (fillRatio >= 0.50 && aspect > 1.6 && aspect <= 3.0) {
+            return "rectangle";
+        }
+        if (fillRatio >= 0.35) {
+            if (aspect <= 1.4) {
+                return "parallelogram";
+            } else {
+                return "trapezium";
+            }
+        }
+        if (aspect > 1.6) {
+            return "crescent";
+        }
+        return "triangle";
+    }
+
+    // ---------- Season inference ----------
+
+    private static String inferSeasonFromFilename(String imageName) {
+        if (imageName == null) return null;
+        String digits = imageName.replaceAll("[^0-9]", " ");
+        String[] parts = digits.trim().split("\\s+");
+        for (String p : parts) {
+            if (p.length() == 8) {
+                try {
+                    int year = Integer.parseInt(p.substring(0, 4));
+                    int month = Integer.parseInt(p.substring(4, 6));
+                    int day = Integer.parseInt(p.substring(6, 8));
+                    if (year < 1900 || month < 1 || month > 12 || day < 1 || day > 31) continue;
+                    return seasonFromMonth(month);
+                } catch (NumberFormatException e) {
+                    // ignore
+                }
+            }
+        }
+        return "Unknown";
+    }
+
+    private static String seasonFromMonth(int month) {
+        switch (month) {
+            case 12:
+            case 1:
+            case 2:
+                return "Winter";
+            case 3:
+            case 4:
+            case 5:
+                return "Spring";
+            case 6:
+            case 7:
+            case 8:
+                return "Summer";
+            case 9:
+            case 10:
+            case 11:
+                return "Autumn";
+            default:
+                return "Unknown";
+        }
+    }
+
+    // ---------- Images_All.csv ----------
+
+    private static List<List<String>> buildImagesAllRows(
+            List<ImageRecord> records,
+            Set<String> allRawCodes
+    ) {
         List<List<String>> rows = new ArrayList<>();
 
         List<String> header = new ArrayList<>();
         header.add("image_name");
         header.add("folder_name");
+        header.add("polarization");
         header.add("flooding");
         header.add("season");
-        header.add("polarization");
         header.add("raw_mean");
-        header.add("black_shape");
+
+        header.add("black_component_size");
         header.add("black_width");
         header.add("black_height");
         header.add("black_diameter");
-        header.add("white_shape");
+        header.add("black_shape");
+
+        header.add("white_component_size");
         header.add("white_width");
         header.add("white_height");
         header.add("white_diameter");
+        header.add("white_shape");
+
         header.add("dominant_shape");
-        header.addAll(allRawCodes);
+
+        for (String code : allRawCodes) {
+            header.add(code);
+        }
 
         rows.add(header);
 
@@ -854,23 +917,28 @@ public class Data_Extraction_M1_Optimized {
             List<String> row = new ArrayList<>();
             row.add(rec.imageName);
             row.add(rec.folderName);
-            row.add(Boolean.toString(rec.flooding));
-            row.add(rec.season);
             row.add(rec.polarization);
+            row.add(Boolean.toString(rec.flooding));
+            row.add(rec.season == null ? "" : rec.season);
             row.add(Double.toString(rec.rawMean));
-            row.add(rec.blackShape);
-            row.add(Integer.toString(rec.blackWidth));
-            row.add(Integer.toString(rec.blackHeight));
-            row.add(Double.toString(rec.blackDiameter));
-            row.add(rec.whiteShape);
-            row.add(Integer.toString(rec.whiteWidth));
-            row.add(Integer.toString(rec.whiteHeight));
-            row.add(Double.toString(rec.whiteDiameter));
+
+            row.add(Integer.toString(rec.blackStats.size));
+            row.add(Integer.toString(rec.blackStats.width));
+            row.add(Integer.toString(rec.blackStats.height));
+            row.add(Double.toString(rec.blackStats.diameter));
+            row.add(rec.blackStats.shape);
+
+            row.add(Integer.toString(rec.whiteStats.size));
+            row.add(Integer.toString(rec.whiteStats.width));
+            row.add(Integer.toString(rec.whiteStats.height));
+            row.add(Double.toString(rec.whiteStats.diameter));
+            row.add(rec.whiteStats.shape);
+
             row.add(rec.dominantShape);
 
-            for (String rawCode : allRawCodes) {
-                Integer count = rec.rawCounts.get(rawCode);
-                row.add((count != null) ? Integer.toString(count) : "0");
+            for (String code : allRawCodes) {
+                Integer count = rec.rawCounts.get(code);
+                row.add(count == null ? "0" : count.toString());
             }
 
             rows.add(row);
@@ -879,303 +947,756 @@ public class Data_Extraction_M1_Optimized {
         return rows;
     }
 
+    // ---------- Summary_All.csv (multi-section) ----------
+
     private static List<List<String>> buildSummaryAllRows(List<ImageRecord> records) {
-        List<List<String>> rows = new ArrayList<>();
+        List<List<String>> out = new ArrayList<>();
 
-        rows.add(Collections.singletonList("COUNTS"));
-        rows.add(Arrays.asList("metric", "VV", "VH", "OTHER", "TOTAL"));
+        // Descriptive header:
+        List<String> header = new ArrayList<>();
+        header.add("section");
+        header.add("metric_name");
+        header.add("value_a");
+        header.add("value_b");
+        header.add("value_c");
+        header.add("value_d");
+        header.add("notes");
+        out.add(header);
 
-        Map<String, int[]> polCounts = new LinkedHashMap<>();
-        polCounts.put("total_images", new int[4]);
-        polCounts.put("flood_true", new int[4]);
-        polCounts.put("flood_false", new int[4]);
+        if (records.isEmpty()) {
+            out.add(row7("NOTE", "no_data", "", "", "", "",
+                    "No images produced data rows; summary is empty."));
+            return out;
+        }
 
-        int idxVV = 0, idxVH = 1, idxOT = 2, idxTotal = 3;
+        out.addAll(buildStatsSection(records));
+        out.addAll(buildSeasonsSection(records));
+        out.addAll(buildShapesSection(records));
+        out.addAll(buildWeightsSection(records));
+        out.addAll(buildXYTableSection(records));
+
+        List<String> ruleRow = new ArrayList<>();
+        ruleRow.add("DECISION_RULE");
+        ruleRow.add("score_formula");
+        ruleRow.add("");
+        ruleRow.add("");
+        ruleRow.add("");
+        ruleRow.add("");
+        ruleRow.add("score = w_raw*z_raw_mean + w_bd*z_black_diameter + w_wd*z_white_diameter + w_season + w_pol + w_black_shape + w_white_shape; z_feature = (x - mean_all)/std_all; P(FLOODING=true) = 1/(1+exp(-score)).");
+        out.add(ruleRow);
+
+        return out;
+    }
+
+    // ---------- STATS section (post-mode from RAW pixel counts) ----------
+
+    private static List<List<String>> buildStatsSection(List<ImageRecord> records) {
+        List<List<String>> out = new ArrayList<>();
+
+        List<Double> valsTrueAll = new ArrayList<>();
+        List<Double> valsFalseAll = new ArrayList<>();
 
         for (ImageRecord rec : records) {
-            int idx;
-            if ("VV".equalsIgnoreCase(rec.polarization)) {
-                idx = idxVV;
-            } else if ("VH".equalsIgnoreCase(rec.polarization)) {
-                idx = idxVH;
-            } else {
-                idx = idxOT;
-            }
+            if (rec.flooding) valsTrueAll.add(rec.rawMean);
+            else valsFalseAll.add(rec.rawMean);
+        }
 
-            polCounts.get("total_images")[idx]++;
-            polCounts.get("total_images")[idxTotal]++;
+        int nTrueAll = valsTrueAll.size();
+        int nFalseAll = valsFalseAll.size();
 
+        double meanTrueAll = mean(valsTrueAll);
+        double meanFalseAll = mean(valsFalseAll);
+        double stdTrueAll = stddev(valsTrueAll, meanTrueAll);
+        double stdFalseAll = stddev(valsFalseAll, meanFalseAll);
+
+        // 3-sigma outlier removal (per group) for post-mean stats
+        List<Double> valsTrueNo = filterByZScore(valsTrueAll, meanTrueAll, stdTrueAll, 3.0);
+        List<Double> valsFalseNo = filterByZScore(valsFalseAll, meanFalseAll, stdFalseAll, 3.0);
+
+        int nTrueNo = valsTrueNo.size();
+        int nFalseNo = valsFalseNo.size();
+
+        double meanTrueNo = mean(valsTrueNo);
+        double meanFalseNo = mean(valsFalseNo);
+        double stdTrueNo = stddev(valsTrueNo, meanTrueNo);
+        double stdFalseNo = stddev(valsFalseNo, meanFalseNo);
+
+        // For median, ignore raw_mean == 0.0 after outlier removal so background-only cases do not dominate.
+        List<Double> valsTrueNoNoZero = removeZeros(valsTrueNo);
+        List<Double> valsFalseNoNoZero = removeZeros(valsFalseNo);
+
+        double medianTrueNo = median(valsTrueNoNoZero);
+        double medianFalseNo = median(valsFalseNoNoZero);
+
+        double cohensDNo = cohenD(meanTrueNo, stdTrueNo, nTrueNo, meanFalseNo, stdFalseNo, nFalseNo);
+
+        String medianTrueStr  = valsTrueNoNoZero.isEmpty()  ? "" : Double.toString(medianTrueNo);
+        String medianFalseStr = valsFalseNoNoZero.isEmpty() ? "" : Double.toString(medianFalseNo);
+
+        // Compute mode from RAW pixel counts across post-mean images.
+        Map<Integer, Long> rawCountsTrue = new HashMap<>();
+        Map<Integer, Long> rawCountsFalse = new HashMap<>();
+
+        // Precompute thresholds to decide if an image is post-mean or not,
+        double thrTrue = (stdTrueAll == 0.0) ? Double.POSITIVE_INFINITY : 3.0 * stdTrueAll;
+        double thrFalse = (stdFalseAll == 0.0) ? Double.POSITIVE_INFINITY : 3.0 * stdFalseAll;
+
+        for (ImageRecord rec : records) {
             if (rec.flooding) {
-                polCounts.get("flood_true")[idx]++;
-                polCounts.get("flood_true")[idxTotal]++;
+                if (Math.abs(rec.rawMean - meanTrueAll) > thrTrue) {
+                    continue; // outlier
+                }
+                accumulateRawCounts(rec, rawCountsTrue);
             } else {
-                polCounts.get("flood_false")[idx]++;
-                polCounts.get("flood_false")[idxTotal]++;
+                if (Math.abs(rec.rawMean - meanFalseAll) > thrFalse) {
+                    continue; // outlier
+                }
+                accumulateRawCounts(rec, rawCountsFalse);
             }
         }
 
-        for (Map.Entry<String, int[]> e : polCounts.entrySet()) {
-            String metric = e.getKey();
-            int[] c = e.getValue();
-            rows.add(Arrays.asList(
-                    metric,
-                    Integer.toString(c[idxVV]),
-                    Integer.toString(c[idxVH]),
-                    Integer.toString(c[idxOT]),
-                    Integer.toString(c[idxTotal])
-            ));
+        Integer modeRawTrue = findModeRaw(rawCountsTrue, true);
+        Integer modeRawFalse = findModeRaw(rawCountsFalse, true);
+
+        String modeTrueStr = (modeRawTrue == null) ? "" : Integer.toString(modeRawTrue);
+        String modeFalseStr = (modeRawFalse == null) ? "" : Integer.toString(modeRawFalse);
+
+        out.add(row7("STATS", "count_images_all",
+                Integer.toString(nTrueAll),
+                Integer.toString(nFalseAll),
+                "",
+                "",
+                "True/false image counts, pre-mean (no outlier removal)."));
+
+        out.add(row7("STATS", "count_images_post_mean",
+                Integer.toString(nTrueNo),
+                Integer.toString(nFalseNo),
+                "",
+                "",
+                "Images retained for post-mean (|x-mean| <= 3*std within each group)."));
+
+        out.add(row7("STATS", "mean_raw_pre",
+                Double.toString(meanTrueAll),
+                Double.toString(meanFalseAll),
+                "",
+                "",
+                "Pre-mean raw_mean across all images (zeros ignored at pixel level)."));
+
+        out.add(row7("STATS", "std_raw_pre",
+                Double.toString(stdTrueAll),
+                Double.toString(stdFalseAll),
+                "",
+                "",
+                "Pre-std raw_mean across all images."));
+
+        out.add(row7("STATS", "post_mean_raw",
+                Double.toString(meanTrueNo),
+                Double.toString(meanFalseNo),
+                "",
+                "",
+                "Post-mean raw_mean after 3-sigma outlier removal (pixel-level zeros ignored)."));
+
+        out.add(row7("STATS", "post_std_raw",
+                Double.toString(stdTrueNo),
+                Double.toString(stdFalseNo),
+                "",
+                "",
+                "Post-std raw_mean after 3-sigma outlier removal."));
+
+        out.add(row7("STATS", "post_median_raw",
+                medianTrueStr,
+                medianFalseStr,
+                "",
+                "",
+                "Post-median raw_mean after 3-sigma removal; zeros excluded from median calculation."));
+
+        out.add(row7("STATS", "post_mode_raw",
+                modeTrueStr,
+                modeFalseStr,
+                "",
+                "",
+                "Post-mode RAW value: RAW sample whose total pixel count is highest across post-mean images in each group; zero-count RAW values are ignored and RAW_00000 is skipped."));
+
+        out.add(row7("STATS", "cohens_d_post_mean_raw",
+                Double.toString(cohensDNo),
+                "",
+                "",
+                "",
+                "Effect size on post-mean data: (mean_true - mean_false) / pooled_std."));
+
+        return out;
+    }
+
+    private static void accumulateRawCounts(ImageRecord rec, Map<Integer, Long> accumulator) {
+        for (Map.Entry<String, Integer> e : rec.rawCounts.entrySet()) {
+            String key = e.getKey();
+            if (!key.startsWith("RAW_")) continue;
+            String numStr = key.substring(4);
+            int rawVal;
+            try {
+                rawVal = Integer.parseInt(numStr);
+            } catch (NumberFormatException ex) {
+                continue;
+            }
+            int count = e.getValue();
+            if (count <= 0) continue;
+            long current = accumulator.getOrDefault(rawVal, 0L);
+            accumulator.put(rawVal, current + count);
         }
+    }
 
-        rows.add(Collections.emptyList());
+    private static Integer findModeRaw(Map<Integer, Long> counts, boolean disallowZeroRaw) {
+        Integer bestRaw = null;
+        long bestCount = 0L;
+        for (Map.Entry<Integer, Long> e : counts.entrySet()) {
+            int raw = e.getKey();
+            long c = e.getValue();
+            if (c <= 0L) continue;
+            if (disallowZeroRaw && raw == 0) continue; // skip RAW=0 when requested
+            if (bestRaw == null || c > bestCount || (c == bestCount && raw < bestRaw)) {
+                bestCount = c;
+                bestRaw = raw;
+            }
+        }
+        return bestRaw;
+    }
 
-        rows.add(Collections.singletonList("SEASONS"));
-        rows.add(Arrays.asList("season", "count", "flood_true", "flood_false", "true_rate"));
+    private static List<String> row7(String section, String name,
+                                     String v1, String v2, String v3, String v4, String notes) {
+        List<String> r = new ArrayList<>();
+        r.add(section);
+        r.add(name);
+        r.add(v1 == null ? "" : v1);
+        r.add(v2 == null ? "" : v2);
+        r.add(v3 == null ? "" : v3);
+        r.add(v4 == null ? "" : v4);
+        r.add(notes == null ? "" : notes);
+        return r;
+    }
 
-        Map<String, int[]> seasonCounts = new LinkedHashMap<>();
+    // ---------- SEASONS section ----------
+
+    private static List<List<String>> buildSeasonsSection(List<ImageRecord> records) {
+        List<List<String>> out = new ArrayList<>();
+
+        Map<String, Integer> trueCounts = new HashMap<>();
+        Map<String, Integer> falseCounts = new HashMap<>();
 
         for (ImageRecord rec : records) {
-            String season = (rec.season == null || rec.season.isEmpty()) ? "UNKNOWN" : rec.season;
-            int[] counts = seasonCounts.computeIfAbsent(season, s -> new int[3]);
-            counts[0]++;
+            String season = (rec.season == null || rec.season.isEmpty()) ? "Unknown" : rec.season;
             if (rec.flooding) {
+                trueCounts.put(season, trueCounts.getOrDefault(season, 0) + 1);
+            } else {
+                falseCounts.put(season, falseCounts.getOrDefault(season, 0) + 1);
+            }
+        }
+
+        String[] seasons = new String[]{"Winter", "Spring", "Summer", "Autumn", "Unknown"};
+        for (String s : seasons) {
+            int ct = trueCounts.getOrDefault(s, 0);
+            int cf = falseCounts.getOrDefault(s, 0);
+            int total = ct + cf;
+            double rate = (total > 0) ? ((double) ct / (double) total) : 0.0;
+            out.add(row7("SEASONS", s,
+                    Integer.toString(ct),
+                    Integer.toString(cf),
+                    Double.toString(rate),
+                    "",
+                    "True_rate = count_true / (count_true + count_false) for this season."));
+        }
+
+        return out;
+    }
+
+    // ---------- SHAPES section ----------
+
+    private static List<List<String>> buildShapesSection(List<ImageRecord> records) {
+        List<List<String>> out = new ArrayList<>();
+
+        Map<String, Integer> blackTrue = new HashMap<>();
+        Map<String, Integer> blackFalse = new HashMap<>();
+        Map<String, Integer> whiteTrue = new HashMap<>();
+        Map<String, Integer> whiteFalse = new HashMap<>();
+
+        for (ImageRecord rec : records) {
+            String bShape = rec.blackStats.shape == null ? "none" : rec.blackStats.shape;
+            String wShape = rec.whiteStats.shape == null ? "none" : rec.whiteStats.shape;
+            if (rec.flooding) {
+                blackTrue.put(bShape, blackTrue.getOrDefault(bShape, 0) + 1);
+                whiteTrue.put(wShape, whiteTrue.getOrDefault(wShape, 0) + 1);
+            } else {
+                blackFalse.put(bShape, blackFalse.getOrDefault(bShape, 0) + 1);
+                whiteFalse.put(wShape, whiteFalse.getOrDefault(wShape, 0) + 1);
+            }
+        }
+
+        out.add(row7("SHAPES", "NOTE",
+                "",
+                "",
+                "",
+                "",
+                "Each image contributes one black and one white largest component (after filters and fallback)."));
+
+        Set<String> allShapesBlack = new TreeSet<>(blackTrue.keySet());
+        allShapesBlack.addAll(blackFalse.keySet());
+        for (String s : allShapesBlack) {
+            int ct = blackTrue.getOrDefault(s, 0);
+            int cf = blackFalse.getOrDefault(s, 0);
+            out.add(row7("SHAPES", "black_" + s,
+                    Integer.toString(ct),
+                    Integer.toString(cf),
+                    "",
+                    "",
+                    "Largest black-component shape = " + s));
+        }
+
+        Set<String> allShapesWhite = new TreeSet<>(whiteTrue.keySet());
+        allShapesWhite.addAll(whiteFalse.keySet());
+        for (String s : allShapesWhite) {
+            int ct = whiteTrue.getOrDefault(s, 0);
+            int cf = whiteFalse.getOrDefault(s, 0);
+            out.add(row7("SHAPES", "white_" + s,
+                    Integer.toString(ct),
+                    Integer.toString(cf),
+                    "",
+                    "",
+                    "Largest white-component shape = " + s));
+        }
+
+        return out;
+    }
+
+    // ---------- WEIGHTS section (numeric + season + shape + polarization) ----------
+
+    private static List<List<String>> buildWeightsSection(List<ImageRecord> records) {
+        List<List<String>> out = new ArrayList<>();
+        WeightContext ctx = computeWeights(records);
+
+        out.add(row7("WEIGHTS", "raw_mean",
+                Double.toString(ctx.wRaw),
+                Double.toString(ctx.meanRawAll),
+                Double.toString(ctx.stdRawAll),
+                "",
+                "Numeric weight: Cohen's d on raw_mean (per-image mean over non-zero pixels)."));
+
+        out.add(row7("WEIGHTS", "black_diameter",
+                Double.toString(ctx.wBd),
+                Double.toString(ctx.meanBdAll),
+                Double.toString(ctx.stdBdAll),
+                "",
+                "Numeric weight: Cohen's d on black diameter."));
+
+        out.add(row7("WEIGHTS", "white_diameter",
+                Double.toString(ctx.wWd),
+                Double.toString(ctx.meanWdAll),
+                Double.toString(ctx.stdWdAll),
+                "",
+                "Numeric weight: Cohen's d on white diameter."));
+
+        for (Map.Entry<String, Double> e : ctx.seasonWeight.entrySet()) {
+            String s = e.getKey();
+            double w = e.getValue();
+            out.add(row7("WEIGHTS", "season_" + s,
+                    Double.toString(w),
+                    "",
+                    Double.toString(ctx.overallTrueRate),
+                    "",
+                    "Season weight = true_rate(season) - overall_true_rate (only shown if season sample size >= threshold)."));
+        }
+
+        for (Map.Entry<String, Double> e : ctx.polWeight.entrySet()) {
+            String pol = e.getKey();
+            double w = e.getValue();
+            out.add(row7("WEIGHTS", "pol_" + pol,
+                    Double.toString(w),
+                    "",
+                    Double.toString(ctx.overallTrueRate),
+                    "",
+                    "Polarization weight = true_rate(pol) - overall_true_rate."));
+        }
+
+        for (Map.Entry<String, Double> e : ctx.blackShapeWeight.entrySet()) {
+            String s = e.getKey();
+            double w = e.getValue();
+            out.add(row7("WEIGHTS", "black_shape_" + s,
+                    Double.toString(w),
+                    "",
+                    Double.toString(ctx.overallTrueRate),
+                    "",
+                    "Black shape weight = true_rate(shape) - overall_true_rate."));
+        }
+
+        for (Map.Entry<String, Double> e : ctx.whiteShapeWeight.entrySet()) {
+            String s = e.getKey();
+            double w = e.getValue();
+            out.add(row7("WEIGHTS", "white_shape_" + s,
+                    Double.toString(w),
+                    "",
+                    Double.toString(ctx.overallTrueRate),
+                    "",
+                    "White shape weight = true_rate(shape) - overall_true_rate."));
+        }
+
+        return out;
+    }
+
+    private static WeightContext computeWeights(List<ImageRecord> records) {
+        WeightContext ctx = new WeightContext();
+
+        int totalTrue = 0, totalFalse = 0;
+        for (ImageRecord rec : records) {
+            if (rec.flooding) totalTrue++;
+            else totalFalse++;
+        }
+        ctx.overallTrueRate = (totalTrue + totalFalse > 0)
+                ? ((double) totalTrue / (double) (totalTrue + totalFalse))
+                : 0.0;
+
+        List<Double> rawTrue = new ArrayList<>();
+        List<Double> rawFalse = new ArrayList<>();
+        List<Double> rawAll = new ArrayList<>();
+
+        List<Double> bdTrue = new ArrayList<>();
+        List<Double> bdFalse = new ArrayList<>();
+        List<Double> bdAll = new ArrayList<>();
+
+        List<Double> wdTrue = new ArrayList<>();
+        List<Double> wdFalse = new ArrayList<>();
+        List<Double> wdAll = new ArrayList<>();
+
+        for (ImageRecord rec : records) {
+            double rm = rec.rawMean;
+            double bd = rec.blackStats.diameter;
+            double wd = rec.whiteStats.diameter;
+
+            rawAll.add(rm);
+            bdAll.add(bd);
+            wdAll.add(wd);
+
+            if (rec.flooding) {
+                rawTrue.add(rm);
+                bdTrue.add(bd);
+                wdTrue.add(wd);
+            } else {
+                rawFalse.add(rm);
+                bdFalse.add(bd);
+                wdFalse.add(wd);
+            }
+        }
+
+        ctx.meanRawAll = mean(rawAll);
+        ctx.stdRawAll = stddev(rawAll, ctx.meanRawAll);
+        double meanRawTrue = mean(rawTrue);
+        double meanRawFalse = mean(rawFalse);
+        double sdRawTrue = stddev(rawTrue, meanRawTrue);
+        double sdRawFalse = stddev(rawFalse, meanRawFalse);
+        ctx.wRaw = cohenD(meanRawTrue, sdRawTrue, rawTrue.size(),
+                meanRawFalse, sdRawFalse, rawFalse.size());
+
+        ctx.meanBdAll = mean(bdAll);
+        ctx.stdBdAll = stddev(bdAll, ctx.meanBdAll);
+        double meanBdTrue = mean(bdTrue);
+        double meanBdFalse = mean(bdFalse);
+        double sdBdTrue = stddev(bdTrue, meanBdTrue);
+        double sdBdFalse = stddev(bdFalse, meanBdFalse);
+        ctx.wBd = cohenD(meanBdTrue, sdBdTrue, bdTrue.size(),
+                meanBdFalse, sdBdFalse, bdFalse.size());
+
+        ctx.meanWdAll = mean(wdAll);
+        ctx.stdWdAll = stddev(wdAll, ctx.meanWdAll);
+        double meanWdTrue = mean(wdTrue);
+        double meanWdFalse = mean(wdFalse);
+        double sdWdTrue = stddev(wdTrue, meanWdTrue);
+        double sdWdFalse = stddev(wdFalse, meanWdFalse);
+        ctx.wWd = cohenD(meanWdTrue, sdWdTrue, wdTrue.size(),
+                meanWdFalse, sdWdFalse, wdFalse.size());
+
+        // Season weights
+        Map<String, Integer> seasonTrue = new HashMap<>();
+        Map<String, Integer> seasonFalse = new HashMap<>();
+        for (ImageRecord rec : records) {
+            String s = (rec.season == null || rec.season.isEmpty()) ? "Unknown" : rec.season;
+            if (rec.flooding) seasonTrue.put(s, seasonTrue.getOrDefault(s, 0) + 1);
+            else seasonFalse.put(s, seasonFalse.getOrDefault(s, 0) + 1);
+        }
+        String[] seasons = new String[]{"Winter", "Spring", "Summer", "Autumn", "Unknown"};
+        int minSeasonCount = 30; // below this, treat weight as 0 (insufficient evidence)
+        for (String s : seasons) {
+            int ct = seasonTrue.getOrDefault(s, 0);
+            int cf = seasonFalse.getOrDefault(s, 0) + 1; // +1 for slight smoothing
+            int total = ct + cf;
+            if (total == 0) continue;
+            if (total < minSeasonCount) {
+                ctx.seasonWeight.put(s, 0.0);
+                continue;
+            }
+            double rate = (double) ct / (double) total;
+            ctx.seasonWeight.put(s, rate - ctx.overallTrueRate);
+        }
+
+        // Polarization weights
+        Map<String, Integer> polTrue = new HashMap<>();
+        Map<String, Integer> polFalse = new HashMap<>();
+        for (ImageRecord rec : records) {
+            String p = rec.polarization == null ? "OTHER" : rec.polarization;
+            if (rec.flooding) polTrue.put(p, polTrue.getOrDefault(p, 0) + 1);
+            else polFalse.put(p, polFalse.getOrDefault(p, 0) + 1);
+        }
+        Set<String> allPol = new TreeSet<>(polTrue.keySet());
+        allPol.addAll(polFalse.keySet());
+        for (String p : allPol) {
+            int ct = polTrue.getOrDefault(p, 0);
+            int cf = polFalse.getOrDefault(p, 0) + 1; // +1 smoothing
+            int total = ct + cf;
+            if (total == 0) continue;
+            double rate = (double) ct / (double) total;
+            ctx.polWeight.put(p, rate - ctx.overallTrueRate);
+        }
+
+        // Shape weights
+        Map<String, Integer> blackTrue = new HashMap<>();
+        Map<String, Integer> blackFalse = new HashMap<>();
+        Map<String, Integer> whiteTrue = new HashMap<>();
+        Map<String, Integer> whiteFalse = new HashMap<>();
+        for (ImageRecord rec : records) {
+            String b = rec.blackStats.shape == null ? "none" : rec.blackStats.shape;
+            String w = rec.whiteStats.shape == null ? "none" : rec.whiteStats.shape;
+            if (rec.flooding) {
+                blackTrue.put(b, blackTrue.getOrDefault(b, 0) + 1);
+                whiteTrue.put(w, whiteTrue.getOrDefault(w, 0) + 1);
+            } else {
+                blackFalse.put(b, blackFalse.getOrDefault(b, 0) + 1);
+                whiteFalse.put(w, whiteFalse.getOrDefault(w, 0) + 1);
+            }
+        }
+        Set<String> allB = new TreeSet<>(blackTrue.keySet());
+        allB.addAll(blackFalse.keySet());
+        for (String s : allB) {
+            int ct = blackTrue.getOrDefault(s, 0);
+            int cf = blackFalse.getOrDefault(s, 0) + 1; // smoothing
+            int total = ct + cf;
+            if (total == 0) continue;
+            double rate = (double) ct / (double) total;
+            ctx.blackShapeWeight.put(s, rate - ctx.overallTrueRate);
+        }
+
+        Set<String> allW = new TreeSet<>(whiteTrue.keySet());
+        allW.addAll(whiteFalse.keySet());
+        for (String s : allW) {
+            int ct = whiteTrue.getOrDefault(s, 0);
+            int cf = whiteFalse.getOrDefault(s, 0) + 1; // smoothing
+            int total = ct + cf;
+            if (total == 0) continue;
+            double rate = (double) ct / (double) total;
+            ctx.whiteShapeWeight.put(s, rate - ctx.overallTrueRate);
+        }
+
+        return ctx;
+    }
+
+
+    // ---------- XY_TABLE section (empirical probability by season/pol/shapes within |z_raw_mean| <= 1) ----------
+
+    private static List<List<String>> buildXYTableSection(List<ImageRecord> records) {
+        List<List<String>> out = new ArrayList<>();
+
+        // Header row describing columns:
+        out.add(row7(
+                "XY_TABLE", "COLUMNS",
+                "total_images",
+                "prob_true_percent",
+                "count_true",
+                "count_false",
+                "For XY_TABLE rows: metric_name encodes season, polarization, black_shape, white_shape; " +
+                        "value_a = total images in this combination (within |z_raw_mean| <= 1)," +
+                        " value_b = P(FLOODING=true)%," +
+                        " value_c = number of true-labelled images, value_d = number of false-labelled images."));
+
+        if (records.isEmpty()) {
+            return out;
+        }
+
+        // Overall mean/std of rawMean for z-score thresholding
+        double sum = 0.0;
+        double sumSq = 0.0;
+        int n = 0;
+        for (ImageRecord r : records) {
+            double v = r.rawMean;
+            if (Double.isNaN(v)) continue;
+            sum += v;
+            sumSq += v * v;
+            n++;
+        }
+        if (n == 0) {
+            return out;
+        }
+        double mean = sum / n;
+        double var = (sumSq / n) - (mean * mean);
+        double std = var > 0.0 ? Math.sqrt(var) : 0.0;
+        if (std == 0.0) {
+            // Can't form z-scores; just bail with header only.
+            return out;
+        }
+
+        double zThreshold = 1.0; // within one std dev of overall mean
+
+        // Aggregate counts keyed by (season, pol, black_shape, white_shape)
+        Map<String, int[]> comboCounts = new TreeMap<>();
+        for (ImageRecord r : records) {
+            double v = r.rawMean;
+            if (Double.isNaN(v)) continue;
+            double z = (v - mean) / std;
+            if (Math.abs(z) > zThreshold) continue;
+
+            String season = (r.season == null || r.season.isEmpty()) ? "Unknown" : r.season;
+            String pol = (r.polarization == null) ? "" : r.polarization;
+
+            String bs = (r.blackStats == null || r.blackStats.shape == null || r.blackStats.shape.isEmpty())
+                    ? "none" : r.blackStats.shape;
+
+            String ws = (r.whiteStats == null || r.whiteStats.shape == null || r.whiteStats.shape.isEmpty())
+                    ? "none" : r.whiteStats.shape;
+
+            String key = "season=" + season + ",pol=" + pol +
+                    ",black_shape=" + bs + ",white_shape=" + ws;
+
+            int[] counts = comboCounts.get(key);
+            if (counts == null) {
+                counts = new int[]{0, 0}; // [false, true]
+                comboCounts.put(key, counts);
+            }
+            if (r.flooding) {
                 counts[1]++;
             } else {
-                counts[2]++;
+                counts[0]++;
             }
         }
 
-        for (Map.Entry<String, int[]> e : seasonCounts.entrySet()) {
-            String season = e.getKey();
-            int[] c = e.getValue();
-            int count = c[0];
-            int floodTrue = c[1];
-            int floodFalse = c[2];
-            double trueRate = (count > 0) ? (double) floodTrue / (double) count : 0.0;
-            rows.add(Arrays.asList(
-                    season,
-                    Integer.toString(count),
-                    Integer.toString(floodTrue),
-                    Integer.toString(floodFalse),
-                    Double.toString(trueRate)
-            ));
+        int minComboCount = 10; // only show combinations with enough data
+        for (Map.Entry<String, int[]> e : comboCounts.entrySet()) {
+            String key = e.getKey();
+            int[] counts = e.getValue();
+            int cFalse = counts[0];
+            int cTrue = counts[1];
+            int total = cFalse + cTrue;
+            if (total < minComboCount) continue;
+
+            double prob = (total > 0) ? ((double) cTrue / (double) total) * 100.0 : 0.0;
+            out.add(row7(
+                    "XY_TABLE", key,
+                    Integer.toString(total),            // value_a: total images
+                    Double.toString(prob),             // value_b: probability %
+                    Integer.toString(cTrue),           // value_c: true count
+                    Integer.toString(cFalse),          // value_d: false count
+                    ""));
         }
 
-        rows.add(Collections.emptyList());
-
-        rows.add(Collections.singletonList("SHAPES"));
-        rows.add(Arrays.asList("shape_type", "shape_name", "count", "flood_true", "flood_false", "true_rate"));
-
-        Map<String, Map<String, int[]>> shapeCounts = new LinkedHashMap<>();
-        shapeCounts.put("black", new LinkedHashMap<>());
-        shapeCounts.put("white", new LinkedHashMap<>());
-
-        for (ImageRecord rec : records) {
-            String bShape = (rec.blackShape == null || rec.blackShape.isEmpty()) ? "none" : rec.blackShape;
-            String wShape = (rec.whiteShape == null || rec.whiteShape.isEmpty()) ? "none" : rec.whiteShape;
-
-            int[] bCounts = shapeCounts.get("black").computeIfAbsent(bShape, s -> new int[3]);
-            int[] wCounts = shapeCounts.get("white").computeIfAbsent(wShape, s -> new int[3]);
-
-            bCounts[0]++;
-            wCounts[0]++;
-
-            if (rec.flooding) {
-                bCounts[1]++;
-                wCounts[1]++;
-            } else {
-                bCounts[2]++;
-                wCounts[2]++;
-            }
-        }
-
-        for (Map.Entry<String, Map<String, int[]>> eType : shapeCounts.entrySet()) {
-            String type = eType.getKey();
-            for (Map.Entry<String, int[]> eShape : eType.getValue().entrySet()) {
-                String shape = eShape.getKey();
-                int[] c = eShape.getValue();
-                int count = c[0];
-                int floodTrue = c[1];
-                int floodFalse = c[2];
-                double trueRate = (count > 0) ? (double) floodTrue / (double) count : 0.0;
-
-                rows.add(Arrays.asList(
-                        type,
-                        shape,
-                        Integer.toString(count),
-                        Integer.toString(floodTrue),
-                        Integer.toString(floodFalse),
-                        Double.toString(trueRate)
-                ));
-            }
-        }
-
-        rows.add(Collections.emptyList());
-
-        rows.add(Collections.singletonList("WEIGHTS"));
-        rows.add(Arrays.asList("feature", "weight"));
-
-        Map<Integer, Long> globalRawCounts = new TreeMap<>();
-        for (ImageRecord rec : records) {
-            for (Map.Entry<String, Integer> e : rec.rawCounts.entrySet()) {
-                String key = e.getKey();
-                if (!key.startsWith("RAW_")) continue;
-                String numStr = key.substring(4);
-                int rawVal;
-                try {
-                    rawVal = Integer.parseInt(numStr);
-                } catch (NumberFormatException ex) {
-                    continue;
-                }
-                int count = e.getValue();
-                if (count <= 0) continue;
-                long current = globalRawCounts.getOrDefault(rawVal, 0L);
-                globalRawCounts.put(rawVal, current + count);
-            }
-        }
-
-        rows.add(Arrays.asList("raw_mean", "1.0"));
-        rows.add(Arrays.asList("black_diameter", "1.0"));
-        rows.add(Arrays.asList("white_diameter", "1.0"));
-
-        rows.add(Collections.emptyList());
-
-        rows.add(Collections.singletonList("XY_TABLE"));
-        rows.add(Arrays.asList("season", "polarization", "black_shape", "white_shape", "count", "flood_true", "true_rate"));
-
-        Map<String, Map<String, Map<String, Map<String, int[]>>>> xy = new LinkedHashMap<>();
-
-        List<Double> rawMeans = new ArrayList<>();
-        for (ImageRecord rec : records) {
-            rawMeans.add(rec.rawMean);
-        }
-        double overallMean = 0.0;
-        for (double v : rawMeans) {
-            overallMean += v;
-        }
-        overallMean = (rawMeans.isEmpty()) ? 0.0 : (overallMean / rawMeans.size());
-
-        double overallVar = 0.0;
-        for (double v : rawMeans) {
-            double diff = v - overallMean;
-            overallVar += diff * diff;
-        }
-        overallVar = (rawMeans.size() > 1) ? (overallVar / (rawMeans.size() - 1)) : 0.0;
-        double overallStd = (overallVar > 0.0) ? Math.sqrt(overallVar) : 1.0;
-
-        for (ImageRecord rec : records) {
-            double z = (rec.rawMean - overallMean) / overallStd;
-            if (Math.abs(z) > 1.0) continue;
-
-            String season = (rec.season == null || rec.season.isEmpty()) ? "UNKNOWN" : rec.season;
-            String pol = (rec.polarization == null || rec.polarization.isEmpty()) ? "OTHER" : rec.polarization;
-            String bShape = (rec.blackShape == null || rec.blackShape.isEmpty()) ? "none" : rec.blackShape;
-            String wShape = (rec.whiteShape == null || rec.whiteShape.isEmpty()) ? "none" : rec.whiteShape;
-
-            xy.computeIfAbsent(season, s -> new LinkedHashMap<>())
-                    .computeIfAbsent(pol, s -> new LinkedHashMap<>())
-                    .computeIfAbsent(bShape, s -> new LinkedHashMap<>())
-                    .computeIfAbsent(wShape, s -> new int[3]);
-
-            int[] c = xy.get(season).get(pol).get(bShape).get(wShape);
-            c[0]++;
-            if (rec.flooding) c[1]++;
-        }
-
-        for (Map.Entry<String, Map<String, Map<String, Map<String, int[]>>>> eSeason : xy.entrySet()) {
-            String season = eSeason.getKey();
-            for (Map.Entry<String, Map<String, Map<String, int[]>>> ePol : eSeason.getValue().entrySet()) {
-                String pol = ePol.getKey();
-                for (Map.Entry<String, Map<String, int[]>> eBlack : ePol.getValue().entrySet()) {
-                    String bShape = eBlack.getKey();
-                    for (Map.Entry<String, int[]> eWhite : eBlack.getValue().entrySet()) {
-                        String wShape = eWhite.getKey();
-                        int[] c = eWhite.getValue();
-                        int count = c[0];
-                        int floodTrue = c[1];
-                        double trueRate = (count > 0) ? (double) floodTrue / (double) count : 0.0;
-
-                        rows.add(Arrays.asList(
-                                season,
-                                pol,
-                                bShape,
-                                wShape,
-                                Integer.toString(count),
-                                Integer.toString(floodTrue),
-                                Double.toString(trueRate)
-                        ));
-                    }
-                }
-            }
-        }
-
-        rows.add(Collections.emptyList());
-
-        rows.add(Collections.singletonList("DECISION_RULE"));
-        rows.add(Arrays.asList(
-                "Interpretation",
-                "Score = w_raw_mean * (raw_mean - overall_mean)/overall_std + w_black_diam * black_diameter + w_white_diam * white_diameter + ...; Probability = 1 / (1 + exp(-Score))"
-        ));
-
-        return rows;
+        return out;
     }
+
+    // ---------- Skipped.csv ----------
 
     private static List<List<String>> buildSkippedRows(List<SkipRecord> skips) {
         List<List<String>> rows = new ArrayList<>();
-        rows.add(Arrays.asList("image_name", "folder_name", "reason"));
+        List<String> header = new ArrayList<>();
+        header.add("image_name");
+        header.add("folder_name");
+        header.add("reason");
+        rows.add(header);
+
         for (SkipRecord s : skips) {
-            rows.add(Arrays.asList(s.imageName, s.folderName, s.reason));
+            List<String> row = new ArrayList<>();
+            row.add(s.imageName);
+            row.add(s.folderName);
+            row.add(s.reason);
+            rows.add(row);
         }
         return rows;
     }
 
-    // ---------- CSV writing ----------
+    // ---------- basic stats helpers ----------
+
+    private static double mean(List<Double> vals) {
+        int n = vals.size();
+        if (n == 0) return 0.0;
+        double s = 0.0;
+        for (double v : vals) s += v;
+        return s / n;
+    }
+
+    private static double stddev(List<Double> vals, double mean) {
+        int n = vals.size();
+        if (n <= 1) return 0.0;
+        double s2 = 0.0;
+        for (double v : vals) {
+            double d = v - mean;
+            s2 += d * d;
+        }
+        return Math.sqrt(s2 / n);
+    }
+
+    private static List<Double> filterByZScore(List<Double> vals, double mean, double std, double z) {
+        if (vals.isEmpty() || std == 0.0) return new ArrayList<>(vals);
+        List<Double> out = new ArrayList<>();
+        double thr = z * std;
+        for (double v : vals) {
+            if (Math.abs(v - mean) <= thr) out.add(v);
+        }
+        return out;
+    }
+
+    private static double median(List<Double> vals) {
+        int n = vals.size();
+        if (n == 0) return 0.0;
+        List<Double> copy = new ArrayList<>(vals);
+        Collections.sort(copy);
+        if (n % 2 == 1) return copy.get(n / 2);
+        return 0.5 * (copy.get(n / 2 - 1) + copy.get(n / 2));
+    }
+
+    // Remove exact zeros from a list (used for median so that 0.0
+    // does not dominate when it is just a background value).
+    private static List<Double> removeZeros(List<Double> vals) {
+        List<Double> out = new ArrayList<>();
+        for (double v : vals) {
+            if (v != 0.0) {
+                out.add(v);
+            }
+        }
+        return out;
+    }
+
+    private static double cohenD(double mean1, double std1, int n1,
+                                 double mean2, double std2, int n2) {
+        if (n1 < 2 || n2 < 2) return 0.0;
+        double var1 = std1 * std1;
+        double var2 = std2 * std2;
+        double pooled = Math.sqrt(((n1 - 1) * var1 + (n2 - 1) * var2) / (double) (n1 + n2 - 2));
+        if (pooled == 0.0) return 0.0;
+        return (mean1 - mean2) / pooled;
+    }
+
+    // ---------- CSV writer ----------
 
     private static void writeCsv(Path path, List<List<String>> rows) throws IOException {
         try (BufferedWriter writer = Files.newBufferedWriter(path, StandardCharsets.UTF_8)) {
             for (List<String> row : rows) {
-                writer.write(escapeCsvRow(row));
+                StringBuilder line = new StringBuilder();
+                for (int i = 0; i < row.size(); i++) {
+                    if (i > 0) line.append(',');
+                    String field = row.get(i);
+                    if (field == null) field = "";
+                    String escaped = field.replace("\"", "\"\"");
+                    if (escaped.contains(",") || escaped.contains("\"") ||
+                            escaped.contains("\n") || escaped.contains("\r")) {
+                        line.append('"').append(escaped).append('"');
+                    } else {
+                        line.append(escaped);
+                    }
+                }
+                writer.write(line.toString());
                 writer.newLine();
             }
         }
-    }
-
-    private static String escapeCsvRow(List<String> row) {
-        StringBuilder sb = new StringBuilder();
-        boolean first = true;
-        for (String field : row) {
-            if (!first) sb.append(',');
-            first = false;
-            if (field == null) field = "";
-            boolean needQuotes =
-                    field.contains(",") ||
-                            field.contains("\"") ||
-                            field.contains("\n") ||
-                            field.contains("\r");
-            if (needQuotes) {
-                sb.append('"');
-                for (int i = 0; i < field.length(); i++) {
-                    char c = field.charAt(i);
-                    if (c == '"') sb.append('"');
-                    sb.append(c);
-                }
-                sb.append('"');
-            } else {
-                sb.append(field);
-            }
-        }
-        return sb.toString();
-    }
-}
-
-/**
- * SummaryGeneratorLogistic
- *
- * (full existing logistic summary implementation goes here; unchanged, just
- *  made package-private by removing `public` and imports moved to the top
- *  of the file with Data_Extraction_M1_Optimized.)
- */
-class SummaryGeneratorLogistic {
-    public static void main(String[] args) {
-        // ... your existing SummaryGeneratorLogistic.java content ...
     }
 }
