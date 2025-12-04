@@ -200,10 +200,11 @@ public class Data_Extraction_M1_Optimized {
             return;
         }
 
-        if (floodBySentinelName.isEmpty()) {
-            System.err.println("[FATAL] No FLOODING labels loaded from S1list.json or S2list.json. Aborting.");
-            return;
+        boolean noLabelsFound = floodBySentinelName.isEmpty();
+        if (noLabelsFound) {
+            System.err.println("[WARN] No FLOODING labels found in S1list.json or S2list.json. Proceeding with flooding=false for all images.");
         }
+        final boolean assumeFloodFalse = noLabelsFound;
 
         System.out.println("[INFO] Flood entries loaded from JSON: " + floodBySentinelName.size());
 
@@ -227,7 +228,7 @@ public class Data_Extraction_M1_Optimized {
             futures.add(pool.submit(new Callable<JobResult>() {
                 @Override
                 public JobResult call() {
-                    return processImageJob(job, floodBySentinelName);
+                    return processImageJob(job, floodBySentinelName, assumeFloodFalse);
                 }
             }));
         }
@@ -443,23 +444,27 @@ public class Data_Extraction_M1_Optimized {
 
     // ---------- Image job processing ----------
 
-    private static JobResult processImageJob(ImageJob job, Map<String, Boolean> floodBySentinelName) {
+    private static JobResult processImageJob(ImageJob job, Map<String, Boolean> floodBySentinelName, boolean assumeFloodFalse) {
         Path imagePath = job.imagePath;
         String folderName = job.folderName;
         String fileName = imagePath.getFileName().toString();
         String baseName = stripExtension(fileName);
 
         Boolean floodFlag = null;
-        for (Map.Entry<String, Boolean> e : floodBySentinelName.entrySet()) {
-            String key = e.getKey();
-            if (baseName.contains(key)) {
-                floodFlag = e.getValue();
-                break;
+        if (floodBySentinelName.isEmpty() && assumeFloodFalse) {
+            floodFlag = Boolean.FALSE;
+        } else {
+            for (Map.Entry<String, Boolean> e : floodBySentinelName.entrySet()) {
+                String key = e.getKey();
+                if (baseName.contains(key)) {
+                    floodFlag = e.getValue();
+                    break;
+                }
             }
-        }
 
-        if (floodFlag == null) {
-            return new JobResult(null, new SkipRecord(fileName, folderName, "No matching FLOODING label in JSON."));
+            if (floodFlag == null) {
+                return new JobResult(null, new SkipRecord(fileName, folderName, "No matching FLOODING label in JSON."));
+            }
         }
 
         BufferedImage image;
