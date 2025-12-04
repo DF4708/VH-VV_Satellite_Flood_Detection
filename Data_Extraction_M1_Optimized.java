@@ -109,6 +109,7 @@ public class Data_Extraction_M1_Optimized {
 
     private static class ImageAnalysis {
         double rawMean;
+        double rawMeanNoZero;
         String blackShape;
         int blackWidth;
         int blackHeight;
@@ -137,6 +138,7 @@ public class Data_Extraction_M1_Optimized {
         String season;
         String polarization;
         double rawMean;
+        double rawMeanNoZero;
         String blackShape;
         int blackWidth;
         int blackHeight;
@@ -183,6 +185,7 @@ public class Data_Extraction_M1_Optimized {
         double ciHigh95;
         double logitCoefficient;
         double oddsRatio;
+        double marginOfError95;
         String confidenceFromN;
     }
 
@@ -533,6 +536,7 @@ public class Data_Extraction_M1_Optimized {
         record.polarization = (polarization != null) ? polarization : "";
 
         record.rawMean = analysis.rawMean;
+        record.rawMeanNoZero = analysis.rawMeanNoZero;
         record.blackShape = analysis.blackShape;
         record.blackWidth = analysis.blackWidth;
         record.blackHeight = analysis.blackHeight;
@@ -770,6 +774,7 @@ public class Data_Extraction_M1_Optimized {
 
         ImageAnalysis analysis = new ImageAnalysis();
         analysis.rawMean = rawMean;
+        analysis.rawMeanNoZero = rawMean;
         analysis.blackShape = blackShape;
         analysis.blackWidth = blackComponent.getWidth();
         analysis.blackHeight = blackComponent.getHeight();
@@ -861,16 +866,16 @@ public class Data_Extraction_M1_Optimized {
 
         double fillRatio = (double) comp.pixelCount / (double) (width * height);
 
-        if (fillRatio > 0.75 && aspect < 1.2) {
+        if (fillRatio >= 0.82 && aspect <= 1.08) {
             return "square";
         }
-        if (fillRatio > 0.75 && aspect >= 1.2 && aspect < 3.0) {
+        if (fillRatio >= 0.78 && aspect > 1.08 && aspect < 2.8) {
             return "rectangle";
         }
-        if (fillRatio > 0.6 && aspect < 1.2) {
+        if (fillRatio > 0.68 && aspect <= 1.15) {
             return "circle";
         }
-        if (fillRatio > 0.5 && aspect >= 1.2 && aspect < 2.5) {
+        if (fillRatio > 0.55 && aspect > 1.15 && aspect < 2.5) {
             return "ellipse";
         }
         if (fillRatio > 0.4 && aspect >= 2.5) {
@@ -951,10 +956,16 @@ public class Data_Extraction_M1_Optimized {
         header.add("value_c");
         header.add("value_d");
         header.add("notes");
+        header.add("baseline_category");
+        header.add("confidence_from_n");
+        header.add("standard_error");
+        header.add("ci_low_95");
+        header.add("ci_high_95");
+        header.add("margin_of_error_95");
         out.add(header);
 
         out.add(row7("NOTE", "columns_general",
-                "value_a/value_b/value_c/value_d meanings are section-specific; see notes rows below",
+                "value_a/value_b/value_c/value_d meanings are section-specific; see notes rows below. Baseline/confidence/SE/CI/margin columns are populated for LOGIT_SUMMARY and left blank elsewhere.",
                 "",
                 "",
                 "",
@@ -1004,23 +1015,32 @@ public class Data_Extraction_M1_Optimized {
         }
 
         if (logisticBundle != null && logisticBundle.stats != null && !logisticBundle.stats.isEmpty()) {
-            out.add(row7("LOGIT_SUMMARY", "columns",
-                    "value_a = empirical_flood_rate",
-                    "value_b = logit_coefficient",
-                    "value_c = odds_ratio",
-                    "value_d = samples",
-                    "notes include baseline, confidence_from_n, standard_error, and 95% CI"));
+            out.add(row13("LOGIT_SUMMARY", "columns",
+                    "empirical_flood_rate",
+                    "logit_coefficient",
+                    "odds_ratio",
+                    "samples",
+                    "Each row has explicit baseline/confidence/SE/CI/margin columns.",
+                    "baseline",
+                    "confidence_from_n",
+                    "standard_error",
+                    "ci_low_95",
+                    "ci_high_95",
+                    "margin_of_error_95"));
 
             for (CategoryStats cs : logisticBundle.stats) {
-                out.add(row7("LOGIT_SUMMARY", cs.attribute + ":" + cs.category,
+                out.add(row13("LOGIT_SUMMARY", cs.attribute + ":" + cs.category,
                         Double.toString(cs.empiricalFloodRate),
                         Double.toString(cs.logitCoefficient),
                         Double.toString(cs.oddsRatio),
                         Integer.toString(cs.samples),
-                        "baseline=" + cs.baselineCategory
-                                + "; conf=" + cs.confidenceFromN
-                                + "; se=" + cs.standardError
-                                + "; ci=[" + cs.ciLow95 + "," + cs.ciHigh95 + "]"));
+                        "",
+                        cs.baselineCategory,
+                        cs.confidenceFromN,
+                        Double.toString(cs.standardError),
+                        Double.toString(cs.ciLow95),
+                        Double.toString(cs.ciHigh95),
+                        Double.toString(cs.marginOfError95)));
             }
 
             out.add(row7("", "", "", "", "", "", ""));
@@ -1219,8 +1239,10 @@ public class Data_Extraction_M1_Optimized {
         return bestRaw;
     }
 
-    private static List<String> row7(String section, String name,
-                                     String v1, String v2, String v3, String v4, String notes) {
+    private static List<String> row13(String section, String name,
+                                      String v1, String v2, String v3, String v4, String notes,
+                                      String baseline, String confidence, String se,
+                                      String ciLow, String ciHigh, String margin95) {
         List<String> r = new ArrayList<>();
         r.add(section);
         r.add(name);
@@ -1229,7 +1251,18 @@ public class Data_Extraction_M1_Optimized {
         r.add(v3 == null ? "" : v3);
         r.add(v4 == null ? "" : v4);
         r.add(notes == null ? "" : notes);
+        r.add(baseline == null ? "" : baseline);
+        r.add(confidence == null ? "" : confidence);
+        r.add(se == null ? "" : se);
+        r.add(ciLow == null ? "" : ciLow);
+        r.add(ciHigh == null ? "" : ciHigh);
+        r.add(margin95 == null ? "" : margin95);
         return r;
+    }
+
+    private static List<String> row7(String section, String name,
+                                     String v1, String v2, String v3, String v4, String notes) {
+        return row13(section, name, v1, v2, v3, v4, notes, "", "", "", "", "", "");
     }
 
     // ---------- SEASONS section ----------
@@ -1761,13 +1794,9 @@ public class Data_Extraction_M1_Optimized {
             return;
         }
 
-        Path summaryPath = rootFolder.resolve("Summary_Updated_Java.csv");
         Path decisionPath = rootFolder.resolve("Decision_Table_Java.csv");
-
-        writeLogisticSummaryCsv(usable.stats, summaryPath.toFile());
         writeDecisionTableCsv(usable.combos, decisionPath.toFile());
 
-        System.out.println("[INFO] Logistic summary written to: " + summaryPath.toAbsolutePath());
         System.out.println("[INFO] Decision table written to: " + decisionPath.toAbsolutePath());
     }
 
@@ -1987,10 +2016,12 @@ public class Data_Extraction_M1_Optimized {
             double se = Double.NaN;
             double ciLow = Double.NaN;
             double ciHigh = Double.NaN;
+            double margin = Double.NaN;
             if (n > 0) {
                 se = Math.sqrt(p * (1.0 - p) / n);
                 ciLow = Math.max(0.0, p - 1.96 * se);
                 ciHigh = Math.min(1.0, p + 1.96 * se);
+                margin = 1.96 * se;
             }
 
             CategoryStats cs = new CategoryStats();
@@ -2001,6 +2032,7 @@ public class Data_Extraction_M1_Optimized {
             cs.standardError = se;
             cs.ciLow95 = ciLow;
             cs.ciHigh95 = ciHigh;
+            cs.marginOfError95 = margin;
             cs.isBaseline = (baseline != null && baseline.equals(cat));
             cs.baselineCategory = cs.isBaseline ? baseline : "";
             cs.confidenceFromN = confidenceLabel(n);
@@ -2107,6 +2139,7 @@ public class Data_Extraction_M1_Optimized {
                     "flood_rate_CI_high_95",
                     "logit_coefficient",
                     "odds_ratio",
+                    "margin_of_error_95",
                     "confidence_from_n"
             ));
 
@@ -2123,6 +2156,7 @@ public class Data_Extraction_M1_Optimized {
                         Double.toString(cs.ciHigh95),
                         Double.toString(cs.logitCoefficient),
                         Double.toString(cs.oddsRatio),
+                        Double.toString(cs.marginOfError95),
                         cs.confidenceFromN
                 ));
             }
@@ -2146,6 +2180,7 @@ public class Data_Extraction_M1_Optimized {
                     "unstable_extreme_flag"
             ));
 
+            boolean wrote = false;
             for (DecisionCombo dc : combos) {
                 boolean passesFloodRate = dc.empiricalFloodRate >= 0.5;
                 boolean passesSample = dc.samples > 358; // strictly greater than 358
@@ -2153,6 +2188,7 @@ public class Data_Extraction_M1_Optimized {
                 if (!(passesFloodRate && passesSample && passesMargin)) {
                     continue;
                 }
+                wrote = true;
                 pw.println(String.join(",",
                         safe(dc.season),
                         safe(dc.polarization),
@@ -2167,6 +2203,37 @@ public class Data_Extraction_M1_Optimized {
                         dc.confidenceFromN,
                         Boolean.toString(dc.unstableExtremeFlag)
                 ));
+            }
+
+            if (!wrote) {
+                // Fallback: still surface the strongest combinations so the table is never empty.
+                List<DecisionCombo> fallback = new ArrayList<>();
+                for (DecisionCombo dc : combos) {
+                    if (dc.samples >= 50 && dc.empiricalFloodRate >= 0.5) {
+                        fallback.add(dc);
+                    }
+                }
+                fallback.sort(Comparator.comparing((DecisionCombo d) -> d.empiricalFloodRate).reversed()
+                        .thenComparing(d -> -d.samples));
+
+                int limit = Math.min(15, fallback.size());
+                for (int i = 0; i < limit; i++) {
+                    DecisionCombo dc = fallback.get(i);
+                    pw.println(String.join(",",
+                            safe(dc.season),
+                            safe(dc.polarization),
+                            safe(dc.blackShape),
+                            safe(dc.whiteShape),
+                            Integer.toString(dc.samples),
+                            Double.toString(dc.empiricalFloodRate),
+                            Double.toString(dc.standardError),
+                            Double.toString(dc.marginOfError95),
+                            Double.toString(dc.ciLow95),
+                            Double.toString(dc.ciHigh95),
+                            dc.confidenceFromN + " (fallback)",
+                            Boolean.toString(dc.unstableExtremeFlag)
+                    ));
+                }
             }
         }
     }
