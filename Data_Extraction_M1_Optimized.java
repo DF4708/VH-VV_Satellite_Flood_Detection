@@ -191,9 +191,13 @@ public class Data_Extraction_M1_Optimized {
         try {
             if (Files.exists(s1JsonPath)) {
                 parseFloodJsonFile(s1JsonPath, floodBySentinelName);
+            } else {
+                System.out.println("[WARN] Missing S1list.json at: " + s1JsonPath);
             }
             if (Files.exists(s2JsonPath)) {
                 parseFloodJsonFile(s2JsonPath, floodBySentinelName);
+            } else {
+                System.out.println("[WARN] Missing S2list.json at: " + s2JsonPath);
             }
         } catch (IOException e) {
             System.err.println("[FATAL] Failed to read S1list.json/S2list.json: " + e.getMessage());
@@ -208,7 +212,7 @@ public class Data_Extraction_M1_Optimized {
 
         System.out.println("[INFO] Flood entries loaded from JSON: " + floodBySentinelName.size());
 
-        // Gather all image jobs (root + numeric subfolders).
+        // Gather all image jobs anywhere under the root folder.
         List<ImageJob> jobs = new ArrayList<>();
         int discovered = gatherJobs(rootFolder, jobs);
         System.out.println("[INFO] TIF/TIFF images discovered (potential): " + discovered);
@@ -339,40 +343,26 @@ public class Data_Extraction_M1_Optimized {
     private static int gatherJobs(Path rootFolder, List<ImageJob> jobs) {
         int count = 0;
 
-        try (DirectoryStream<Path> ds = Files.newDirectoryStream(rootFolder)) {
-            for (Path entry : ds) {
-                if (Files.isDirectory(entry)) {
-                    String folderName = entry.getFileName().toString();
-                    if (folderName.matches("\\d+")) {
-                        count += gatherJobsInFolder(entry, folderName, jobs);
+        try {
+            // Walk the entire tree so nested folders (not only numeric) are picked up.
+            try (java.util.stream.Stream<Path> stream = Files.walk(rootFolder)) {
+                for (Iterator<Path> it = stream.iterator(); it.hasNext(); ) {
+                    Path entry = it.next();
+                    if (Files.isRegularFile(entry)) {
+                        String nameLower = entry.getFileName().toString().toLowerCase(Locale.ROOT);
+                        if (nameLower.endsWith(".tif") || nameLower.endsWith(".tiff")) {
+                            Path parent = entry.getParent();
+                            String folderName = (parent != null && !parent.equals(rootFolder))
+                                    ? rootFolder.relativize(parent).toString()
+                                    : "";
+                            jobs.add(new ImageJob(entry, folderName));
+                            count++;
+                        }
                     }
                 }
             }
         } catch (IOException e) {
-            System.err.println("[WARN] Failed to scan subfolders: " + e.getMessage());
-        }
-
-        // Also process any TIF/TIFF in the root folder.
-        count += gatherJobsInFolder(rootFolder, "", jobs);
-
-        return count;
-    }
-
-    private static int gatherJobsInFolder(Path folder, String folderName, List<ImageJob> jobs) {
-        int count = 0;
-
-        try (DirectoryStream<Path> ds = Files.newDirectoryStream(folder)) {
-            for (Path entry : ds) {
-                if (Files.isRegularFile(entry)) {
-                    String name = entry.getFileName().toString().toLowerCase(Locale.ROOT);
-                    if (name.endsWith(".tif") || name.endsWith(".tiff")) {
-                        jobs.add(new ImageJob(entry, folderName));
-                        count++;
-                    }
-                }
-            }
-        } catch (IOException e) {
-            System.err.println("[WARN] Failed to list files in " + folder + ": " + e.getMessage());
+            System.err.println("[WARN] Failed to scan folders for TIF/TIFF files: " + e.getMessage());
         }
 
         return count;
@@ -385,18 +375,15 @@ public class Data_Extraction_M1_Optimized {
 
         String json = Files.readString(jsonPath, StandardCharsets.UTF_8);
 
-        // Match both FLOODING followed by filename and filename followed by FLOODING
+        // Match FLOODING/filename pairs within the same JSON object (stop at the first closing brace).
         int before = floodBySentinelName.size();
 
-        // Example pattern inside each object:
-        //   "FLOODING": false ... "filename": "S2_2019-02-04"
         java.util.regex.Pattern floodingThenFile = java.util.regex.Pattern.compile(
-                "\\\"FLOODING\\\"\\s*:\\s*(true|false).*?\\\"filename\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"",
+                "\\\"FLOODING\\\"\\s*:\\s*(true|false)[^}]*?\\\"filename\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"",
                 java.util.regex.Pattern.CASE_INSENSITIVE | java.util.regex.Pattern.DOTALL);
 
-        // Sometimes filename may appear before FLOODING; match that as well.
         java.util.regex.Pattern fileThenFlooding = java.util.regex.Pattern.compile(
-                "\\\"filename\\\"\\s*:\\s*\\\"([^\\\"]+)\\\".*?\\\"FLOODING\\\"\\s*:\\s*(true|false)",
+                "\\\"filename\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"[^}]*?\\\"FLOODING\\\"\\s*:\\s*(true|false)",
                 java.util.regex.Pattern.CASE_INSENSITIVE | java.util.regex.Pattern.DOTALL);
 
         addMatches(json, floodingThenFile, floodBySentinelName);

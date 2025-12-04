@@ -24,7 +24,7 @@ javac /workspace/Image_Java_Singular/Data_Extraction_M1_Optimized.java
 When you run the program it performs the full pipeline without any extra scripts:
 
 1. Cleans the dataset folder by removing non-TIFF artifacts (except Java/JSON files).
-2. Parses `S1list.json` and `S2list.json` labels. If neither file is present, the tool still runs and assumes `flooding=false` for every image so CSVs are produced without manual post-processing.
-3. Processes all `.tif` / `.tiff` images concurrently.
+2. Parses `S1list.json` and `S2list.json` labels. If neither file is present, the tool still runs and assumes `flooding=false` for every image so CSVs are produced without manual post-processing. The parser warns if a JSON file is missing or yields zero matches to help pinpoint malformed entries.
+3. Processes all `.tif` / `.tiff` images concurrently, scanning every subfolder under the dataset root (not just numeric folders).
 4. Writes `Images_All.csv`, `Summary_All.csv`, and `Skipped.csv` to the dataset root.
 5. Generates `Auto_Probabilities.csv`, a lightweight logistic-style probability table (based only on the extracted features) so no external `SummaryGeneratorLogistic` step is needed.
