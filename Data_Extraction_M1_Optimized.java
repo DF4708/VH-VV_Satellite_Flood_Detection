@@ -209,6 +209,11 @@ public class Data_Extraction_M1_Optimized {
         double[] weights;
     }
 
+    private static class LogisticBundle {
+        List<CategoryStats> stats;
+        List<DecisionCombo> combos;
+    }
+
     // ---------- Main entry point ----------
 
     public static void main(String[] args) {
@@ -323,8 +328,10 @@ public class Data_Extraction_M1_Optimized {
         // Build main per-image CSV rows.
         List<List<String>> imagesAllRows = buildImagesAllRows(records, allRawCodes);
 
+        LogisticBundle logisticBundle = computeLogisticBundle(records);
+
         // Build summary CSV sections.
-        List<List<String>> summaryAllRows = buildSummaryAllRows(records);
+        List<List<String>> summaryAllRows = buildSummaryAllRows(records, logisticBundle);
 
         // Build skipped CSV rows.
         List<List<String>> skippedRows = buildSkippedRows(skips);
@@ -346,7 +353,7 @@ public class Data_Extraction_M1_Optimized {
         System.out.println("[INFO] Images_All.csv, Summary_All.csv, and Skipped.csv written in: " + rootFolder);
 
         try {
-            writeLogisticSummaries(rootFolder, records);
+            writeLogisticSummaries(rootFolder, records, logisticBundle);
         } catch (IOException e) {
             System.err.println("[WARN] Failed to write logistic summaries: " + e.getMessage());
         }
@@ -931,7 +938,7 @@ public class Data_Extraction_M1_Optimized {
         return rows;
     }
 
-    private static List<List<String>> buildSummaryAllRows(List<ImageRecord> records) {
+    private static List<List<String>> buildSummaryAllRows(List<ImageRecord> records, LogisticBundle logisticBundle) {
         List<List<String>> out = new ArrayList<>();
 
         // Descriptive header:
@@ -945,10 +952,66 @@ public class Data_Extraction_M1_Optimized {
         header.add("notes");
         out.add(header);
 
+        out.add(row7("NOTE", "columns_general",
+                "value_a/value_b/value_c/value_d meanings are section-specific; see notes rows below",
+                "",
+                "",
+                "",
+                ""));
+        out.add(row7("NOTE", "columns_stats",
+                "STATS: value_a = flooding=true metric, value_b = flooding=false metric; value_c/value_d noted per row",
+                "",
+                "",
+                "",
+                ""));
+        out.add(row7("NOTE", "columns_seasons_shapes",
+                "SEASONS/SHAPES: value_a = flooding=true count, value_b = flooding=false count, value_c = true_rate",
+                "",
+                "",
+                "",
+                ""));
+        out.add(row7("NOTE", "columns_weights",
+                "WEIGHTS numeric: value_a = Cohen's d, value_b = overall mean, value_c = overall std, value_d = samples;"
+                        + " categorical: value_a = shrunken rate delta, value_b = empirical rate, value_c = samples, value_d = reliability (n/(n+50))",
+                "",
+                "",
+                "",
+                ""));
+        out.add(row7("NOTE", "columns_xy_decision",
+                "XY_TABLE provides its own column guide; DECISION_RULE uses the notes column for the formula",
+                "",
+                "",
+                "",
+                ""));
+
         if (records.isEmpty()) {
             out.add(row7("NOTE", "no_data", "", "", "", "",
                     "No images produced data rows; summary is empty."));
             return out;
+        }
+
+        if (logisticBundle != null && logisticBundle.stats != null && !logisticBundle.stats.isEmpty()) {
+            out.add(row7("LOGIT_SUMMARY", "columns",
+                    "value_a = empirical_flood_rate",
+                    "value_b = logit_coefficient",
+                    "value_c = odds_ratio",
+                    "value_d = samples",
+                    "notes include baseline, confidence_from_n, standard_error, and 95% CI"));
+
+            for (CategoryStats cs : logisticBundle.stats) {
+                out.add(row7("LOGIT_SUMMARY", cs.attribute + ":" + cs.category,
+                        Double.toString(cs.empiricalFloodRate),
+                        Double.toString(cs.logitCoefficient),
+                        Double.toString(cs.oddsRatio),
+                        Integer.toString(cs.samples),
+                        "baseline=" + cs.baselineCategory
+                                + "; conf=" + cs.confidenceFromN
+                                + "; se=" + cs.standardError
+                                + "; ci=[" + cs.ciLow95 + "," + cs.ciHigh95 + "]"));
+            }
+
+            out.add(row7("", "", "", "", "", "", ""));
+            out.add(row7("", "", "", "", "", "", ""));
         }
 
         out.addAll(buildStatsSection(records));
@@ -1254,72 +1317,94 @@ public class Data_Extraction_M1_Optimized {
         List<List<String>> out = new ArrayList<>();
         WeightContext ctx = computeWeights(records);
 
+        out.add(row7("WEIGHTS", "numeric_columns",
+                "value_a = Cohen's d",
+                "value_b = overall mean",
+                "value_c = overall std",
+                "value_d = samples",
+                "Numeric weights compare flooding=true vs flooding=false using Cohen's d."));
+
         out.add(row7("WEIGHTS", "raw_mean",
                 Double.toString(ctx.wRaw),
                 Double.toString(ctx.meanRawAll),
                 Double.toString(ctx.stdRawAll),
-                "",
-                "Numeric weight: Cohen's d on raw_mean."));
+                Integer.toString(ctx.sampleCount),
+                "raw_mean is over non-zero pixels only."));
 
         out.add(row7("WEIGHTS", "black_diameter",
                 Double.toString(ctx.wBd),
                 Double.toString(ctx.meanBdAll),
                 Double.toString(ctx.stdBdAll),
-                "",
-                "Numeric weight: Cohen's d on black diameter."));
+                Integer.toString(ctx.sampleCount),
+                ""));
 
         out.add(row7("WEIGHTS", "white_diameter",
                 Double.toString(ctx.wWd),
                 Double.toString(ctx.meanWdAll),
                 Double.toString(ctx.stdWdAll),
-                "",
-                "Numeric weight: Cohen's d on white diameter."));
+                Integer.toString(ctx.sampleCount),
+                ""));
 
-        for (Map.Entry<String, Double> e : ctx.seasonWeight.entrySet()) {
+        out.add(row7("WEIGHTS", "categorical_columns",
+                "value_a = shrunken (rate - overall_true_rate)",
+                "value_b = empirical rate",
+                "value_c = samples",
+                "value_d = reliability (n/(n+50))",
+                "True/false counts and shrinkage avoid over-weighting tiny groups."));
+
+        for (Map.Entry<String, WeightEntry> e : ctx.seasonWeight.entrySet()) {
             String s = e.getKey();
-            double w = e.getValue();
+            WeightEntry w = e.getValue();
             out.add(row7("WEIGHTS", "season_" + s,
-                    Double.toString(w),
-                    "",
-                    Double.toString(ctx.overallTrueRate),
-                    "",
-                    "Season weight = true_rate(season) - overall_true_rate."));
+                    Double.toString(w.weight),
+                    Double.toString(w.rate),
+                    Integer.toString(w.trueCount + w.falseCount),
+                    Double.toString(w.reliability),
+                    "true=" + w.trueCount + ", false=" + w.falseCount + "; overall_true_rate=" + ctx.overallTrueRate));
         }
 
-        for (Map.Entry<String, Double> e : ctx.polWeight.entrySet()) {
+        for (Map.Entry<String, WeightEntry> e : ctx.polWeight.entrySet()) {
             String pol = e.getKey();
-            double w = e.getValue();
+            WeightEntry w = e.getValue();
             out.add(row7("WEIGHTS", "pol_" + pol,
-                    Double.toString(w),
-                    "",
-                    Double.toString(ctx.overallTrueRate),
-                    "",
-                    "Polarization weight = true_rate(pol) - overall_true_rate."));
+                    Double.toString(w.weight),
+                    Double.toString(w.rate),
+                    Integer.toString(w.trueCount + w.falseCount),
+                    Double.toString(w.reliability),
+                    "true=" + w.trueCount + ", false=" + w.falseCount + "; overall_true_rate=" + ctx.overallTrueRate));
         }
 
-        for (Map.Entry<String, Double> e : ctx.blackShapeWeight.entrySet()) {
+        for (Map.Entry<String, WeightEntry> e : ctx.blackShapeWeight.entrySet()) {
             String s = e.getKey();
-            double w = e.getValue();
+            WeightEntry w = e.getValue();
             out.add(row7("WEIGHTS", "black_shape_" + s,
-                    Double.toString(w),
-                    "",
-                    Double.toString(ctx.overallTrueRate),
-                    "",
-                    "Black shape weight = true_rate(shape) - overall_true_rate."));
+                    Double.toString(w.weight),
+                    Double.toString(w.rate),
+                    Integer.toString(w.trueCount + w.falseCount),
+                    Double.toString(w.reliability),
+                    "true=" + w.trueCount + ", false=" + w.falseCount + "; overall_true_rate=" + ctx.overallTrueRate));
         }
 
-        for (Map.Entry<String, Double> e : ctx.whiteShapeWeight.entrySet()) {
+        for (Map.Entry<String, WeightEntry> e : ctx.whiteShapeWeight.entrySet()) {
             String s = e.getKey();
-            double w = e.getValue();
+            WeightEntry w = e.getValue();
             out.add(row7("WEIGHTS", "white_shape_" + s,
-                    Double.toString(w),
-                    "",
-                    Double.toString(ctx.overallTrueRate),
-                    "",
-                    "White shape weight = true_rate(shape) - overall_true_rate."));
+                    Double.toString(w.weight),
+                    Double.toString(w.rate),
+                    Integer.toString(w.trueCount + w.falseCount),
+                    Double.toString(w.reliability),
+                    "true=" + w.trueCount + ", false=" + w.falseCount + "; overall_true_rate=" + ctx.overallTrueRate));
         }
 
         return out;
+    }
+
+    private static class WeightEntry {
+        double weight;
+        double rate;
+        int trueCount;
+        int falseCount;
+        double reliability;
     }
 
     private static class WeightContext {
@@ -1327,10 +1412,11 @@ public class Data_Extraction_M1_Optimized {
         double wRaw, meanRawAll, stdRawAll;
         double wBd, meanBdAll, stdBdAll;
         double wWd, meanWdAll, stdWdAll;
-        Map<String, Double> seasonWeight = new HashMap<>();
-        Map<String, Double> polWeight = new HashMap<>();
-        Map<String, Double> blackShapeWeight = new HashMap<>();
-        Map<String, Double> whiteShapeWeight = new HashMap<>();
+        int sampleCount;
+        Map<String, WeightEntry> seasonWeight = new LinkedHashMap<>();
+        Map<String, WeightEntry> polWeight = new LinkedHashMap<>();
+        Map<String, WeightEntry> blackShapeWeight = new LinkedHashMap<>();
+        Map<String, WeightEntry> whiteShapeWeight = new LinkedHashMap<>();
     }
 
     private static WeightContext computeWeights(List<ImageRecord> records) {
@@ -1344,6 +1430,7 @@ public class Data_Extraction_M1_Optimized {
         ctx.overallTrueRate = (totalTrue + totalFalse > 0)
                 ? ((double) totalTrue / (double) (totalTrue + totalFalse))
                 : 0.0;
+        ctx.sampleCount = records.size();
 
         List<Double> rawTrue = new ArrayList<>();
         List<Double> rawFalse = new ArrayList<>();
@@ -1404,87 +1491,61 @@ public class Data_Extraction_M1_Optimized {
         ctx.wWd = cohenD(meanWdTrue, sdWdTrue, wdTrue.size(),
                 meanWdFalse, sdWdFalse, wdFalse.size());
 
-        // Season weights
-        Map<String, Integer> seasonTrue = new HashMap<>();
-        Map<String, Integer> seasonFalse = new HashMap<>();
-        for (ImageRecord rec : records) {
-            String s = (rec.season == null || rec.season.isEmpty()) ? "Unknown" : rec.season;
-            if (rec.flooding) seasonTrue.put(s, seasonTrue.getOrDefault(s, 0) + 1);
-            else seasonFalse.put(s, seasonFalse.getOrDefault(s, 0) + 1);
-        }
-        String[] seasons = new String[]{"Winter", "Spring", "Summer", "Autumn", "Unknown"};
-        int minSeasonCount = 30; // below this, treat weight as 0 (insufficient evidence)
-        for (String s : seasons) {
-            int ct = seasonTrue.getOrDefault(s, 0);
-            int cf = seasonFalse.getOrDefault(s, 0) + 1; // +1 for slight smoothing
-            int total = ct + cf;
-            if (total == 0) continue;
-            if (total < minSeasonCount) {
-                ctx.seasonWeight.put(s, 0.0);
-                continue;
-            }
-            double rate = (double) ct / (double) total;
-            ctx.seasonWeight.put(s, rate - ctx.overallTrueRate);
-        }
+        ctx.seasonWeight.putAll(computeCategoricalWeights(records, ctx.overallTrueRate,
+                rec -> (rec.season == null || rec.season.isEmpty()) ? "Unknown" : rec.season));
 
-        // Polarization weights
-        Map<String, Integer> polTrue = new HashMap<>();
-        Map<String, Integer> polFalse = new HashMap<>();
-        for (ImageRecord rec : records) {
-            String p = rec.polarization == null ? "OTHER" : rec.polarization;
-            if (rec.flooding) polTrue.put(p, polTrue.getOrDefault(p, 0) + 1);
-            else polFalse.put(p, polFalse.getOrDefault(p, 0) + 1);
-        }
-        Set<String> allPol = new TreeSet<>(polTrue.keySet());
-        allPol.addAll(polFalse.keySet());
-        for (String p : allPol) {
-            int ct = polTrue.getOrDefault(p, 0);
-            int cf = polFalse.getOrDefault(p, 0) + 1; // +1 smoothing
-            int total = ct + cf;
-            if (total == 0) continue;
-            double rate = (double) ct / (double) total;
-            ctx.polWeight.put(p, rate - ctx.overallTrueRate);
-        }
+        ctx.polWeight.putAll(computeCategoricalWeights(records, ctx.overallTrueRate,
+                rec -> rec.polarization == null ? "OTHER" : rec.polarization));
 
-        // Shape weights
-        Map<String, Integer> blackTrue = new HashMap<>();
-        Map<String, Integer> blackFalse = new HashMap<>();
-        Map<String, Integer> whiteTrue = new HashMap<>();
-        Map<String, Integer> whiteFalse = new HashMap<>();
-        for (ImageRecord rec : records) {
-            String b = (rec.blackShape == null || rec.blackShape.isEmpty()) ? "none" : rec.blackShape;
-            String w = (rec.whiteShape == null || rec.whiteShape.isEmpty()) ? "none" : rec.whiteShape;
-            if (rec.flooding) {
-                blackTrue.put(b, blackTrue.getOrDefault(b, 0) + 1);
-                whiteTrue.put(w, whiteTrue.getOrDefault(w, 0) + 1);
-            } else {
-                blackFalse.put(b, blackFalse.getOrDefault(b, 0) + 1);
-                whiteFalse.put(w, whiteFalse.getOrDefault(w, 0) + 1);
-            }
-        }
-        Set<String> allB = new TreeSet<>(blackTrue.keySet());
-        allB.addAll(blackFalse.keySet());
-        for (String s : allB) {
-            int ct = blackTrue.getOrDefault(s, 0);
-            int cf = blackFalse.getOrDefault(s, 0) + 1; // smoothing
-            int total = ct + cf;
-            if (total == 0) continue;
-            double rate = (double) ct / (double) total;
-            ctx.blackShapeWeight.put(s, rate - ctx.overallTrueRate);
-        }
+        ctx.blackShapeWeight.putAll(computeCategoricalWeights(records, ctx.overallTrueRate,
+                rec -> (rec.blackShape == null || rec.blackShape.isEmpty()) ? "none" : rec.blackShape));
 
-        Set<String> allW = new TreeSet<>(whiteTrue.keySet());
-        allW.addAll(whiteFalse.keySet());
-        for (String s : allW) {
-            int ct = whiteTrue.getOrDefault(s, 0);
-            int cf = whiteFalse.getOrDefault(s, 0) + 1; // smoothing
-            int total = ct + cf;
-            if (total == 0) continue;
-            double rate = (double) ct / (double) total;
-            ctx.whiteShapeWeight.put(s, rate - ctx.overallTrueRate);
-        }
+        ctx.whiteShapeWeight.putAll(computeCategoricalWeights(records, ctx.overallTrueRate,
+                rec -> (rec.whiteShape == null || rec.whiteShape.isEmpty()) ? "none" : rec.whiteShape));
 
         return ctx;
+    }
+
+    private static Map<String, WeightEntry> computeCategoricalWeights(
+            List<ImageRecord> records,
+            double overallTrueRate,
+            java.util.function.Function<ImageRecord, String> classifier
+    ) {
+        Map<String, Integer> trueCounts = new HashMap<>();
+        Map<String, Integer> falseCounts = new HashMap<>();
+
+        for (ImageRecord rec : records) {
+            String key = classifier.apply(rec);
+            if (rec.flooding) {
+                trueCounts.put(key, trueCounts.getOrDefault(key, 0) + 1);
+            } else {
+                falseCounts.put(key, falseCounts.getOrDefault(key, 0) + 1);
+            }
+        }
+
+        Set<String> all = new TreeSet<>(trueCounts.keySet());
+        all.addAll(falseCounts.keySet());
+
+        Map<String, WeightEntry> out = new LinkedHashMap<>();
+        for (String key : all) {
+            int ct = trueCounts.getOrDefault(key, 0);
+            int cf = falseCounts.getOrDefault(key, 0);
+            int total = ct + cf;
+            if (total == 0) continue;
+
+            double rate = (double) ct / (double) total;
+            double reliability = total / (total + 50.0); // shrink small or imbalanced groups
+            double weight = (rate - overallTrueRate) * reliability;
+
+            WeightEntry entry = new WeightEntry();
+            entry.weight = weight;
+            entry.rate = rate;
+            entry.trueCount = ct;
+            entry.falseCount = cf;
+            entry.reliability = reliability;
+            out.put(key, entry);
+        }
+        return out;
     }
 
     // ---------- XY_TABLE section (empirical probability by season/pol/shapes within |z_raw_mean| <= 1) ----------
@@ -1649,10 +1710,9 @@ public class Data_Extraction_M1_Optimized {
 
     // ---------- Logistic summaries (former SummaryGeneratorLogistic) ----------
 
-    private static void writeLogisticSummaries(Path rootFolder, List<ImageRecord> records) throws IOException {
+    private static LogisticBundle computeLogisticBundle(List<ImageRecord> records) {
         if (records.isEmpty()) {
-            System.out.println("[WARN] Skipping logistic summaries because there are no image records.");
-            return;
+            return null;
         }
 
         String seasonBaseline = "Spring";
@@ -1666,19 +1726,33 @@ public class Data_Extraction_M1_Optimized {
                 blackBaseline,
                 whiteBaseline);
 
-        List<CategoryStats> allStats = new ArrayList<>();
-        allStats.addAll(computeCategoryStats(records, "season", seasonBaseline, model));
-        allStats.addAll(computeCategoryStats(records, "polarization", polBaseline, model));
-        allStats.addAll(computeCategoryStats(records, "black_shape", blackBaseline, model));
-        allStats.addAll(computeCategoryStats(records, "white_shape", whiteBaseline, model));
+        LogisticBundle bundle = new LogisticBundle();
+        bundle.stats = new ArrayList<>();
+        bundle.stats.addAll(computeCategoryStats(records, "season", seasonBaseline, model));
+        bundle.stats.addAll(computeCategoryStats(records, "polarization", polBaseline, model));
+        bundle.stats.addAll(computeCategoryStats(records, "black_shape", blackBaseline, model));
+        bundle.stats.addAll(computeCategoryStats(records, "white_shape", whiteBaseline, model));
+        bundle.combos = computeDecisionCombos(records);
+        return bundle;
+    }
 
-        List<DecisionCombo> combos = computeDecisionCombos(records);
+    private static void writeLogisticSummaries(Path rootFolder, List<ImageRecord> records, LogisticBundle bundle) throws IOException {
+        if (records.isEmpty()) {
+            System.out.println("[WARN] Skipping logistic summaries because there are no image records.");
+            return;
+        }
+
+        LogisticBundle usable = (bundle != null) ? bundle : computeLogisticBundle(records);
+        if (usable == null) {
+            System.out.println("[WARN] Skipping logistic summaries because bundle could not be computed.");
+            return;
+        }
 
         Path summaryPath = rootFolder.resolve("Summary_Updated_Java.csv");
         Path decisionPath = rootFolder.resolve("Decision_Table_Java.csv");
 
-        writeLogisticSummaryCsv(allStats, summaryPath.toFile());
-        writeDecisionTableCsv(combos, decisionPath.toFile());
+        writeLogisticSummaryCsv(usable.stats, summaryPath.toFile());
+        writeDecisionTableCsv(usable.combos, decisionPath.toFile());
 
         System.out.println("[INFO] Logistic summary written to: " + summaryPath.toAbsolutePath());
         System.out.println("[INFO] Decision table written to: " + decisionPath.toAbsolutePath());
