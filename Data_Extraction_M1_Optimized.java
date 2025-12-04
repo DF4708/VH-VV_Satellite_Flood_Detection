@@ -350,7 +350,9 @@ public class Data_Extraction_M1_Optimized {
         LogisticBundle logisticBundle = computeLogisticBundle(records);
 
         // Build summary CSV sections.
-        List<List<String>> summaryAllRows = buildSummaryAllRows(records, logisticBundle);
+        WeightContext weightContext = computeWeights(records);
+
+        List<List<String>> summaryAllRows = buildSummaryAllRows(records, logisticBundle, weightContext);
 
         // Build skipped CSV rows.
         List<List<String>> skippedRows = buildSkippedRows(skips);
@@ -378,7 +380,7 @@ public class Data_Extraction_M1_Optimized {
         }
 
         try {
-            writeAutoProbabilities(rootFolder, records);
+            writeAutoProbabilities(rootFolder, records, weightContext);
         } catch (IOException e) {
             System.err.println("[WARN] Failed to write Auto_Probabilities.csv: " + e.getMessage());
         }
@@ -1013,7 +1015,8 @@ public class Data_Extraction_M1_Optimized {
         return rows;
     }
 
-    private static List<List<String>> buildSummaryAllRows(List<ImageRecord> records, LogisticBundle logisticBundle) {
+    private static List<List<String>> buildSummaryAllRows(List<ImageRecord> records, LogisticBundle logisticBundle,
+                                                          WeightContext weightContext) {
         List<List<String>> out = new ArrayList<>();
 
         // Descriptive header:
@@ -1040,8 +1043,8 @@ public class Data_Extraction_M1_Optimized {
                 "",
                 ""));
         out.add(row7("NOTE", "columns_weights",
-                "WEIGHTS numeric: value_a = Cohen's d, value_b = overall mean, value_c = overall std, value_d = samples;"
-                        + " categorical: value_a = shrunken rate delta, value_b = empirical rate, value_c = samples, value_d = reliability (n/(n+50))",
+                "WEIGHTS numeric columns show Cohen's d, overall mean, overall std, and samples;"
+                        + " categorical columns show shrunken rate delta, empirical rate, samples, and reliability (n/(n+50))",
                 "",
                 "",
                 "",
@@ -1058,8 +1061,8 @@ public class Data_Extraction_M1_Optimized {
                 "",
                 "",
                 ""));
-        out.add(row7("NOTE", "decision_table_filters",
-                "Decision_Table_Java.csv only keeps rows with samples > 358, margin_of_error_95 <= 0.0954, and empirical_flood_rate >= 0.5.",
+        out.add(row7("NOTE", "decision_table_guide",
+                "Decision_Table_Java.csv lists all season/polarization/shape combinations with confidence labels; unstable rows include a note explaining why.",
                 "",
                 "",
                 "",
@@ -1107,7 +1110,7 @@ public class Data_Extraction_M1_Optimized {
         out.addAll(buildStatsSection(records));
         out.addAll(buildSeasonsSection(records));
         out.addAll(buildShapesSection(records));
-        out.addAll(buildWeightsSection(records));
+        out.addAll(buildWeightsSection(records, weightContext));
         out.addAll(buildXYTableSection(records));
 
         List<String> ruleRow = new ArrayList<>();
@@ -1409,9 +1412,8 @@ public class Data_Extraction_M1_Optimized {
 
     // ---------- WEIGHTS section (numeric + season + shape + polarization) ----------
 
-    private static List<List<String>> buildWeightsSection(List<ImageRecord> records) {
+    private static List<List<String>> buildWeightsSection(List<ImageRecord> records, WeightContext ctx) {
         List<List<String>> out = new ArrayList<>();
-        WeightContext ctx = computeWeights(records);
 
         out.add(row7("WEIGHTS", "numeric_columns",
                 "value_a = Cohen's d",
@@ -2227,33 +2229,17 @@ public class Data_Extraction_M1_Optimized {
                     "flood_rate_CI_low_95",
                     "flood_rate_CI_high_95",
                     "confidence_from_n",
-                    "unstable_extreme_flag"
+                    "unstable_extreme_flag",
+                    "notes"
             ));
 
-            List<DecisionCombo> passHigh = new ArrayList<>();
-            List<DecisionCombo> passLow = new ArrayList<>();
+            combos.sort(Comparator.comparing((DecisionCombo dc) -> dc.empiricalFloodRate).reversed()
+                    .thenComparing(dc -> dc.marginOfError95));
+
             for (DecisionCombo dc : combos) {
-                boolean passesSample = dc.samples > 358; // strictly greater than 358
-                boolean passesMargin = !Double.isNaN(dc.marginOfError95) && dc.marginOfError95 <= 0.0954;
-                if (!passesSample || !passesMargin) continue;
-                if (dc.empiricalFloodRate >= 0.5) {
-                    passHigh.add(dc);
-                } else {
-                    passLow.add(dc);
-                }
-            }
-
-            Comparator<DecisionCombo> byConfidence = Comparator
-                    .comparing((DecisionCombo d) -> d.marginOfError95)
-                    .thenComparing(d -> -d.samples);
-            passHigh.sort(byConfidence);
-            passLow.sort(byConfidence);
-
-            int topCount = 3;
-            boolean wrote = false;
-            for (int i = 0; i < Math.min(topCount, passHigh.size()); i++) {
-                DecisionCombo dc = passHigh.get(i);
-                wrote = true;
+                String note = dc.unstableExtremeFlag
+                        ? "unstable due to tiny sample or extreme rate; interpret cautiously"
+                        : "";
                 pw.println(String.join(",",
                         safe(dc.season),
                         safe(dc.polarization),
@@ -2266,49 +2252,9 @@ public class Data_Extraction_M1_Optimized {
                         Double.toString(dc.ciLow95),
                         Double.toString(dc.ciHigh95),
                         dc.confidenceFromN,
-                        Boolean.toString(dc.unstableExtremeFlag)
+                        Boolean.toString(dc.unstableExtremeFlag),
+                        note
                 ));
-            }
-            for (int i = 0; i < Math.min(topCount, passLow.size()); i++) {
-                DecisionCombo dc = passLow.get(i);
-                wrote = true;
-                pw.println(String.join(",",
-                        safe(dc.season),
-                        safe(dc.polarization),
-                        safe(dc.blackShape),
-                        safe(dc.whiteShape),
-                        Integer.toString(dc.samples),
-                        Double.toString(dc.empiricalFloodRate),
-                        Double.toString(dc.standardError),
-                        Double.toString(dc.marginOfError95),
-                        Double.toString(dc.ciLow95),
-                        Double.toString(dc.ciHigh95),
-                        dc.confidenceFromN,
-                        Boolean.toString(dc.unstableExtremeFlag)
-                ));
-            }
-
-            if (!wrote) {
-                List<DecisionCombo> fallback = new ArrayList<>(combos);
-                fallback.sort(byConfidence);
-                int limit = Math.min(6, fallback.size());
-                for (int i = 0; i < limit; i++) {
-                    DecisionCombo dc = fallback.get(i);
-                    pw.println(String.join(",",
-                            safe(dc.season),
-                            safe(dc.polarization),
-                            safe(dc.blackShape),
-                            safe(dc.whiteShape),
-                            Integer.toString(dc.samples),
-                            Double.toString(dc.empiricalFloodRate),
-                            Double.toString(dc.standardError),
-                            Double.toString(dc.marginOfError95),
-                            Double.toString(dc.ciLow95),
-                            Double.toString(dc.ciHigh95),
-                            dc.confidenceFromN + " (fallback)",
-                            Boolean.toString(dc.unstableExtremeFlag)
-                    ));
-                }
             }
         }
     }
@@ -2357,57 +2303,19 @@ public class Data_Extraction_M1_Optimized {
 
     // ---------- Auto post-processing / lightweight logistic-style scores ----------
 
-    private static void writeAutoProbabilities(Path rootFolder, List<ImageRecord> records) throws IOException {
+    private static void writeAutoProbabilities(Path rootFolder, List<ImageRecord> records, WeightContext ctx) throws IOException {
         if (records.isEmpty()) {
             System.out.println("[WARN] Skipping Auto_Probabilities.csv because there are no image records.");
             return;
         }
-
-        double rawSum = 0.0;
-        double rawSqSum = 0.0;
-        double maxBlack = 0.0;
-        double maxWhite = 0.0;
-
-        Map<String, int[]> seasonCounts = new HashMap<>();
-        Map<String, int[]> polCounts = new HashMap<>();
-        Map<String, int[]> blackShapeCounts = new HashMap<>();
-        Map<String, int[]> whiteShapeCounts = new HashMap<>();
-
-        int floodTotal = 0;
-
-        for (ImageRecord rec : records) {
-            rawSum += rec.rawMean;
-            rawSqSum += rec.rawMean * rec.rawMean;
-            if (rec.blackDiameter > maxBlack) maxBlack = rec.blackDiameter;
-            if (rec.whiteDiameter > maxWhite) maxWhite = rec.whiteDiameter;
-
-            addCount(seasonCounts, safe(rec.season), rec.flooding);
-            addCount(polCounts, safe(rec.polarization), rec.flooding);
-            addCount(blackShapeCounts, safe(rec.blackShape), rec.flooding);
-            addCount(whiteShapeCounts, safe(rec.whiteShape), rec.flooding);
-
-            if (rec.flooding) floodTotal++;
-        }
-
-        double count = records.size();
-        double mean = rawSum / count;
-        double variance = Math.max(0.0, (rawSqSum / count) - (mean * mean));
-        double stddev = (variance > 0.0) ? Math.sqrt(variance) : 0.0;
-
-        if (maxBlack == 0.0) maxBlack = 1.0;
-        if (maxWhite == 0.0) maxWhite = 1.0;
-
-        double overallFloodRate = (count > 0.0) ? (floodTotal / count) : 0.0;
-
-        Map<String, Double> seasonWeight = deriveWeights(seasonCounts, overallFloodRate);
-        Map<String, Double> polWeight = deriveWeights(polCounts, overallFloodRate);
-        Map<String, Double> blackWeight = deriveWeights(blackShapeCounts, overallFloodRate);
-        Map<String, Double> whiteWeight = deriveWeights(whiteShapeCounts, overallFloodRate);
+        double confidenceAdjust = (ctx.sampleCount > 0)
+                ? (ctx.sampleCount / (ctx.sampleCount + 50.0))
+                : 0.0;
 
         Path autoPath = rootFolder.resolve("Auto_Probabilities.csv");
 
         try (BufferedWriter writer = Files.newBufferedWriter(autoPath, StandardCharsets.UTF_8)) {
-            writer.write("# score = confidence_adjusted(z_raw + diameters + categorical weights); probability = logistic(score)");
+            writer.write("# score = confidence_adjusted(w_raw*z_raw_mean + w_bd*z_black_diameter + w_wd*z_white_diameter + w_season + w_pol + w_black_shape + w_white_shape); probability = logistic(score); probability is the confidence-weighted chance that the image is flooded given the observed attributes.");
             writer.newLine();
             writer.write("image_name,folder_name,polarization,season,black_shape,white_shape,label_flooding,score,probability");
             writer.newLine();
@@ -2415,19 +2323,24 @@ public class Data_Extraction_M1_Optimized {
             List<List<String>> rows = new ArrayList<>();
 
             for (ImageRecord rec : records) {
-                double zRaw = (stddev > 0.0) ? (rec.rawMean - mean) / stddev : 0.0;
-                double normBlack = rec.blackDiameter / maxBlack;
-                double normWhite = rec.whiteDiameter / maxWhite;
+                double zRaw = (ctx.stdRawAll > 0.0) ? (rec.rawMean - ctx.meanRawAll) / ctx.stdRawAll : 0.0;
+                double zBlack = (ctx.stdBdAll > 0.0) ? (rec.blackDiameter - ctx.meanBdAll) / ctx.stdBdAll : 0.0;
+                double zWhite = (ctx.stdWdAll > 0.0) ? (rec.whiteDiameter - ctx.meanWdAll) / ctx.stdWdAll : 0.0;
 
-                double sWeight = seasonWeight.getOrDefault(safe(rec.season), 0.0);
-                double pWeight = polWeight.getOrDefault(safe(rec.polarization), 0.0);
-                double bWeight = blackWeight.getOrDefault(safe(rec.blackShape), 0.0);
-                double wWeight = whiteWeight.getOrDefault(safe(rec.whiteShape), 0.0);
+                WeightEntry sw = ctx.seasonWeight.get(safe(rec.season));
+                WeightEntry pw = ctx.polWeight.get(safe(rec.polarization));
+                WeightEntry bw = ctx.blackShapeWeight.get(safe(rec.blackShape));
+                WeightEntry ww = ctx.whiteShapeWeight.get(safe(rec.whiteShape));
 
-                double score = zRaw
-                        + (0.6 * normBlack)
-                        + (0.6 * normWhite)
-                        + sWeight + pWeight + bWeight + wWeight;
+                double scoreCore = (ctx.wRaw * zRaw)
+                        + (ctx.wBd * zBlack)
+                        + (ctx.wWd * zWhite)
+                        + ((sw != null) ? sw.weight : 0.0)
+                        + ((pw != null) ? pw.weight : 0.0)
+                        + ((bw != null) ? bw.weight : 0.0)
+                        + ((ww != null) ? ww.weight : 0.0);
+
+                double score = scoreCore * confidenceAdjust;
                 double probability = 1.0 / (1.0 + Math.exp(-score));
 
                 List<String> row = Arrays.asList(
@@ -2452,34 +2365,7 @@ public class Data_Extraction_M1_Optimized {
             }
         }
 
-        System.out.println("[INFO] Auto_Probabilities.csv written with lightweight logistic-style scores in: " + rootFolder);
-    }
-
-    private static Map<String, Double> deriveWeights(Map<String, int[]> counts, double overallFloodRate) {
-        Map<String, Double> out = new HashMap<>();
-        for (Map.Entry<String, int[]> e : counts.entrySet()) {
-            int[] arr = e.getValue();
-            int falseCount = arr[0];
-            int trueCount = arr[1];
-            int total = falseCount + trueCount;
-            if (total == 0) {
-                out.put(e.getKey(), 0.0);
-                continue;
-            }
-            double reliability = total / (double) (total + 50);
-            double rate = trueCount / (double) total;
-            out.put(e.getKey(), (rate - overallFloodRate) * reliability);
-        }
-        return out;
-    }
-
-    private static void addCount(Map<String, int[]> map, String key, boolean flooding) {
-        int[] arr = map.computeIfAbsent(key, k -> new int[2]);
-        if (flooding) {
-            arr[1]++;
-        } else {
-            arr[0]++;
-        }
+        System.out.println("[INFO] Auto_Probabilities.csv written with confidence-adjusted logistic scores in: " + rootFolder);
     }
 }
 
