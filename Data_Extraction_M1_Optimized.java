@@ -5,6 +5,8 @@ import java.awt.image.DataBuffer;
 import java.io.BufferedWriter;
 import java.io.IOException;
 import java.io.File;
+import java.io.FileWriter;
+import java.io.PrintWriter;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
@@ -169,6 +171,44 @@ public class Data_Extraction_M1_Optimized {
         }
     }
 
+    private static class CategoryStats {
+        String attribute;
+        String category;
+        String baselineCategory;
+        boolean isBaseline;
+        int samples;
+        double empiricalFloodRate;
+        double standardError;
+        double ciLow95;
+        double ciHigh95;
+        double logitCoefficient;
+        double oddsRatio;
+        String confidenceFromN;
+    }
+
+    private static class DecisionCombo {
+        String season;
+        String polarization;
+        String blackShape;
+        String whiteShape;
+        int samples;
+        int floodCount;
+        double empiricalFloodRate;
+        double standardError;
+        double ciLow95;
+        double ciHigh95;
+        String confidenceFromN;
+        boolean unstableExtremeFlag;
+    }
+
+    private static class LogisticModel {
+        Map<String, Integer> featureIndex;
+        int rawMeanIndex;
+        int blackDiameterIndex;
+        int numFeatures;
+        double[] weights;
+    }
+
     // ---------- Main entry point ----------
 
     public static void main(String[] args) {
@@ -304,6 +344,12 @@ public class Data_Extraction_M1_Optimized {
         }
 
         System.out.println("[INFO] Images_All.csv, Summary_All.csv, and Skipped.csv written in: " + rootFolder);
+
+        try {
+            writeLogisticSummaries(rootFolder, records);
+        } catch (IOException e) {
+            System.err.println("[WARN] Failed to write logistic summaries: " + e.getMessage());
+        }
 
         try {
             writeAutoProbabilities(rootFolder, records);
@@ -494,6 +540,25 @@ public class Data_Extraction_M1_Optimized {
     }
 
     private static String inferSeasonFromFilename(String filename) {
+        // Prefer an in-string YYYYMMDD (e.g., 20190118) rather than the first digits.
+        java.util.regex.Matcher matcher = java.util.regex.Pattern.compile("20\\d{6}").matcher(filename);
+        while (matcher.find()) {
+            String yyyymmdd = matcher.group();
+            int month;
+            try {
+                month = Integer.parseInt(yyyymmdd.substring(4, 6));
+            } catch (NumberFormatException e) {
+                continue;
+            }
+            if (month < 1 || month > 12) continue;
+
+            if (month == 12 || month <= 2) return "Winter";
+            if (month <= 5) return "Spring";
+            if (month <= 8) return "Summer";
+            if (month <= 11) return "Fall";
+        }
+
+        // Fallback to original digit-scan if no embedded date was found.
         String digits = filename.replaceAll("\\D+", "");
         if (digits.length() < 8) return null;
 
@@ -1113,6 +1178,439 @@ public class Data_Extraction_M1_Optimized {
             rows.add(Arrays.asList(s.imageName, s.folderName, s.reason));
         }
         return rows;
+    }
+
+    // ---------- Logistic summaries (former SummaryGeneratorLogistic) ----------
+
+    private static void writeLogisticSummaries(Path rootFolder, List<ImageRecord> records) throws IOException {
+        if (records.isEmpty()) {
+            System.out.println("[WARN] Skipping logistic summaries because there are no image records.");
+            return;
+        }
+
+        String seasonBaseline = "Spring";
+        String polBaseline = "VH";
+        String blackBaseline = "none";
+        String whiteBaseline = "none";
+
+        LogisticModel model = buildAndTrainLogistic(records,
+                seasonBaseline,
+                polBaseline,
+                blackBaseline,
+                whiteBaseline);
+
+        List<CategoryStats> allStats = new ArrayList<>();
+        allStats.addAll(computeCategoryStats(records, "season", seasonBaseline, model));
+        allStats.addAll(computeCategoryStats(records, "polarization", polBaseline, model));
+        allStats.addAll(computeCategoryStats(records, "black_shape", blackBaseline, model));
+        allStats.addAll(computeCategoryStats(records, "white_shape", whiteBaseline, model));
+
+        List<DecisionCombo> combos = computeDecisionCombos(records);
+
+        Path summaryPath = rootFolder.resolve("Summary_Updated_Java.csv");
+        Path decisionPath = rootFolder.resolve("Decision_Table_Java.csv");
+
+        writeLogisticSummaryCsv(allStats, summaryPath.toFile());
+        writeDecisionTableCsv(combos, decisionPath.toFile());
+
+        System.out.println("[INFO] Logistic summary written to: " + summaryPath.toAbsolutePath());
+        System.out.println("[INFO] Decision table written to: " + decisionPath.toAbsolutePath());
+    }
+
+    private static LogisticModel buildAndTrainLogistic(List<ImageRecord> records,
+                                                       String seasonBaseline,
+                                                       String polBaseline,
+                                                       String blackBaseline,
+                                                       String whiteBaseline) {
+        Set<String> seasonCats = new TreeSet<>();
+        Set<String> polCats = new TreeSet<>();
+        Set<String> bshapeCats = new TreeSet<>();
+        Set<String> wshapeCats = new TreeSet<>();
+
+        for (ImageRecord r : records) {
+            seasonCats.add(safe(r.season));
+            polCats.add(safe(r.polarization));
+            bshapeCats.add(safe(r.blackShape));
+            wshapeCats.add(safe(r.whiteShape));
+        }
+
+        Map<String, Integer> featIndex = new LinkedHashMap<>();
+        int idx = 1; // 0 = bias
+
+        idx = addDummyFeatures("season", seasonCats, seasonBaseline, featIndex, idx);
+        idx = addDummyFeatures("polarization", polCats, polBaseline, featIndex, idx);
+        idx = addDummyFeatures("black_shape", bshapeCats, blackBaseline, featIndex, idx);
+        idx = addDummyFeatures("white_shape", wshapeCats, whiteBaseline, featIndex, idx);
+
+        int rawMeanIndex = idx++;
+        int blackDiamIndex = idx++;
+
+        int numFeatures = idx;
+
+        int n = records.size();
+        double[][] X = new double[n][numFeatures];
+        double[] y = new double[n];
+
+        for (int i = 0; i < n; i++) {
+            ImageRecord r = records.get(i);
+            X[i][0] = 1.0; // bias
+
+            setDummy(X[i], featIndex, "season", safe(r.season), seasonBaseline);
+            setDummy(X[i], featIndex, "polarization", safe(r.polarization), polBaseline);
+            setDummy(X[i], featIndex, "black_shape", safe(r.blackShape), blackBaseline);
+            setDummy(X[i], featIndex, "white_shape", safe(r.whiteShape), whiteBaseline);
+
+            X[i][rawMeanIndex] = r.rawMean;
+            X[i][blackDiamIndex] = r.blackDiameter;
+
+            y[i] = r.flooding ? 1.0 : 0.0;
+        }
+
+        standardizeFeatures(X);
+
+        double[] w = trainLogistic(X, y);
+
+        LogisticModel model = new LogisticModel();
+        model.featureIndex = featIndex;
+        model.rawMeanIndex = rawMeanIndex;
+        model.blackDiameterIndex = blackDiamIndex;
+        model.numFeatures = numFeatures;
+        model.weights = w;
+        return model;
+    }
+
+    private static int addDummyFeatures(String attrName,
+                                        Set<String> cats,
+                                        String baseline,
+                                        Map<String, Integer> featIndex,
+                                        int startIdx) {
+        int idx = startIdx;
+        for (String cat : cats) {
+            String value = (cat == null) ? "" : cat;
+            if (value.equals(baseline)) continue;
+            String key = attrName + "=" + value;
+            featIndex.put(key, idx++);
+        }
+        return idx;
+    }
+
+    private static void setDummy(double[] x,
+                                 Map<String, Integer> featIndex,
+                                 String attrName,
+                                 String value,
+                                 String baseline) {
+        String val = (value == null) ? "" : value;
+        if (val.equals(baseline)) return;
+        String key = attrName + "=" + val;
+        Integer idx = featIndex.get(key);
+        if (idx != null) {
+            x[idx] = 1.0;
+        }
+    }
+
+    private static void standardizeFeatures(double[][] X) {
+        int n = X.length;
+        if (n == 0) return;
+        int m = X[0].length;
+
+        double[] mean = new double[m];
+        double[] std = new double[m];
+
+        for (int j = 1; j < m; j++) {
+            double sum = 0.0;
+            for (int i = 0; i < n; i++) {
+                sum += X[i][j];
+            }
+            mean[j] = sum / n;
+
+            double var = 0.0;
+            for (int i = 0; i < n; i++) {
+                double d = X[i][j] - mean[j];
+                var += d * d;
+            }
+            var /= n;
+            std[j] = Math.sqrt(var);
+        }
+
+        for (int j = 1; j < m; j++) {
+            if (std[j] == 0.0) continue;
+            for (int i = 0; i < n; i++) {
+                X[i][j] = (X[i][j] - mean[j]) / std[j];
+            }
+        }
+    }
+
+    private static double[] trainLogistic(double[][] X, double[] y) {
+        int n = X.length;
+        int m = X[0].length;
+
+        double[] w = new double[m];
+        double learningRate = 0.1;
+        double lambda = 0.01;
+        int maxIter = 5000;
+
+        for (int iter = 0; iter < maxIter; iter++) {
+            double[] grad = new double[m];
+
+            for (int i = 0; i < n; i++) {
+                double z = 0.0;
+                for (int j = 0; j < m; j++) {
+                    z += w[j] * X[i][j];
+                }
+                double p = sigmoid(z);
+                double error = p - y[i];
+
+                for (int j = 0; j < m; j++) {
+                    grad[j] += error * X[i][j];
+                }
+            }
+
+            for (int j = 1; j < m; j++) {
+                grad[j] += lambda * w[j];
+            }
+
+            for (int j = 0; j < m; j++) {
+                w[j] -= learningRate * grad[j] / n;
+            }
+        }
+
+        return w;
+    }
+
+    private static double sigmoid(double z) {
+        if (z > 20) return 1.0;
+        if (z < -20) return 0.0;
+        return 1.0 / (1.0 + Math.exp(-z));
+    }
+
+    private static String confidenceLabel(int n) {
+        if (n >= 500) return "High";
+        if (n >= 100) return "Medium";
+        if (n >= 20) return "Low";
+        if (n >= 5) return "Very Low";
+        return "Extremely Low";
+    }
+
+    private static List<CategoryStats> computeCategoryStats(List<ImageRecord> records,
+                                                            String attributeName,
+                                                            String baseline,
+                                                            LogisticModel model) {
+        Map<String, List<ImageRecord>> byCat = new HashMap<>();
+
+        for (ImageRecord r : records) {
+            String key;
+            switch (attributeName) {
+                case "season":
+                    key = safe(r.season);
+                    break;
+                case "polarization":
+                    key = safe(r.polarization);
+                    break;
+                case "black_shape":
+                    key = safe(r.blackShape);
+                    break;
+                case "white_shape":
+                    key = safe(r.whiteShape);
+                    break;
+                default:
+                    continue;
+            }
+            byCat.computeIfAbsent(key, k -> new ArrayList<>()).add(r);
+        }
+
+        List<CategoryStats> result = new ArrayList<>();
+
+        for (Map.Entry<String, List<ImageRecord>> e : byCat.entrySet()) {
+            String cat = e.getKey();
+            List<ImageRecord> list = e.getValue();
+            int n = list.size();
+            int k = 0;
+            for (ImageRecord r : list) {
+                if (r.flooding) k++;
+            }
+
+            double p = (n > 0) ? (k / (double) n) : Double.NaN;
+            double se = Double.NaN;
+            double ciLow = Double.NaN;
+            double ciHigh = Double.NaN;
+            if (n > 0) {
+                se = Math.sqrt(p * (1.0 - p) / n);
+                ciLow = Math.max(0.0, p - 1.96 * se);
+                ciHigh = Math.min(1.0, p + 1.96 * se);
+            }
+
+            CategoryStats cs = new CategoryStats();
+            cs.attribute = attributeName;
+            cs.category = cat;
+            cs.samples = n;
+            cs.empiricalFloodRate = p;
+            cs.standardError = se;
+            cs.ciLow95 = ciLow;
+            cs.ciHigh95 = ciHigh;
+            cs.isBaseline = (baseline != null && baseline.equals(cat));
+            cs.baselineCategory = cs.isBaseline ? baseline : "";
+            cs.confidenceFromN = confidenceLabel(n);
+
+            if (cs.isBaseline) {
+                cs.logitCoefficient = 0.0;
+                cs.oddsRatio = 1.0;
+            } else {
+                String key = attributeName + "=" + cat;
+                Integer idx = model.featureIndex.get(key);
+                if (idx == null) {
+                    cs.logitCoefficient = 0.0;
+                    cs.oddsRatio = 1.0;
+                } else {
+                    double beta = model.weights[idx];
+                    cs.logitCoefficient = beta;
+                    cs.oddsRatio = Math.exp(beta);
+                }
+            }
+
+            result.add(cs);
+        }
+
+        result.sort(Comparator.comparing(cs -> cs.category));
+        return result;
+    }
+
+    private static List<DecisionCombo> computeDecisionCombos(List<ImageRecord> records) {
+        Map<String, DecisionCombo> map = new HashMap<>();
+
+        for (ImageRecord r : records) {
+            String key = comboKey(safe(r.season), safe(r.polarization), safe(r.blackShape), safe(r.whiteShape));
+            DecisionCombo dc = map.get(key);
+            if (dc == null) {
+                dc = new DecisionCombo();
+                dc.season = safe(r.season);
+                dc.polarization = safe(r.polarization);
+                dc.blackShape = safe(r.blackShape);
+                dc.whiteShape = safe(r.whiteShape);
+                dc.samples = 0;
+                dc.floodCount = 0;
+                map.put(key, dc);
+            }
+            dc.samples++;
+            if (r.flooding) {
+                dc.floodCount++;
+            }
+        }
+
+        List<DecisionCombo> list = new ArrayList<>();
+        for (DecisionCombo dc : map.values()) {
+            if (dc.samples > 0) {
+                dc.empiricalFloodRate = dc.floodCount / (double) dc.samples;
+                double p = dc.empiricalFloodRate;
+                double n = dc.samples;
+                double se = Math.sqrt(p * (1.0 - p) / n);
+                double ciLow = Math.max(0.0, p - 1.96 * se);
+                double ciHigh = Math.min(1.0, p + 1.96 * se);
+                dc.standardError = se;
+                dc.ciLow95 = ciLow;
+                dc.ciHigh95 = ciHigh;
+            } else {
+                dc.empiricalFloodRate = Double.NaN;
+                dc.standardError = Double.NaN;
+                dc.ciLow95 = Double.NaN;
+                dc.ciHigh95 = Double.NaN;
+            }
+            dc.confidenceFromN = confidenceLabel(dc.samples);
+
+            boolean extreme = (dc.empiricalFloodRate == 0.0 || dc.empiricalFloodRate == 1.0);
+            boolean tiny = dc.samples < 10;
+            boolean lowConf = dc.confidenceFromN.equals("Very Low") || dc.confidenceFromN.equals("Extremely Low");
+            dc.unstableExtremeFlag = tiny || (extreme && lowConf);
+
+            list.add(dc);
+        }
+
+        list.sort(Comparator.comparing((DecisionCombo dc) -> dc.empiricalFloodRate).reversed()
+                .thenComparing(dc -> -dc.samples));
+        return list;
+    }
+
+    private static String comboKey(String season, String pol, String bshape, String wshape) {
+        return "s=" + season +
+                "|p=" + pol +
+                "|b=" + bshape +
+                "|w=" + wshape;
+    }
+
+    private static void writeLogisticSummaryCsv(List<CategoryStats> stats, File outFile) throws IOException {
+        try (PrintWriter pw = new PrintWriter(new BufferedWriter(new FileWriter(outFile)))) {
+            pw.println(String.join(",",
+                    "attribute",
+                    "category",
+                    "baseline_category",
+                    "is_baseline",
+                    "samples",
+                    "empirical_flood_rate",
+                    "standard_error",
+                    "flood_rate_CI_low_95",
+                    "flood_rate_CI_high_95",
+                    "logit_coefficient",
+                    "odds_ratio",
+                    "confidence_from_n"
+            ));
+
+            for (CategoryStats cs : stats) {
+                pw.println(String.join(",",
+                        cs.attribute,
+                        cs.category,
+                        cs.baselineCategory,
+                        Boolean.toString(cs.isBaseline),
+                        Integer.toString(cs.samples),
+                        Double.toString(cs.empiricalFloodRate),
+                        Double.toString(cs.standardError),
+                        Double.toString(cs.ciLow95),
+                        Double.toString(cs.ciHigh95),
+                        Double.toString(cs.logitCoefficient),
+                        Double.toString(cs.oddsRatio),
+                        cs.confidenceFromN
+                ));
+            }
+        }
+    }
+
+    private static void writeDecisionTableCsv(List<DecisionCombo> combos, File outFile) throws IOException {
+        try (PrintWriter pw = new PrintWriter(new BufferedWriter(new FileWriter(outFile)))) {
+            pw.println(String.join(",",
+                    "season",
+                    "polarization",
+                    "black_shape",
+                    "white_shape",
+                    "samples",
+                    "empirical_flood_rate",
+                    "standard_error",
+                    "flood_rate_CI_low_95",
+                    "flood_rate_CI_high_95",
+                    "confidence_from_n",
+                    "unstable_extreme_flag"
+            ));
+
+            for (DecisionCombo dc : combos) {
+                if (dc.empiricalFloodRate < 0.5) {
+                    continue;
+                }
+                pw.println(String.join(",",
+                        safe(dc.season),
+                        safe(dc.polarization),
+                        safe(dc.blackShape),
+                        safe(dc.whiteShape),
+                        Integer.toString(dc.samples),
+                        Double.toString(dc.empiricalFloodRate),
+                        Double.toString(dc.standardError),
+                        Double.toString(dc.ciLow95),
+                        Double.toString(dc.ciHigh95),
+                        dc.confidenceFromN,
+                        Boolean.toString(dc.unstableExtremeFlag)
+                ));
+            }
+        }
+    }
+
+    private static String safe(String s) {
+        return (s == null) ? "" : s;
     }
 
     // ---------- CSV writing ----------
