@@ -195,6 +195,7 @@ public class Data_Extraction_M1_Optimized {
         int floodCount;
         double empiricalFloodRate;
         double standardError;
+        double marginOfError95;
         double ciLow95;
         double ciHigh95;
         String confidenceFromN;
@@ -979,6 +980,18 @@ public class Data_Extraction_M1_Optimized {
                 ""));
         out.add(row7("NOTE", "columns_xy_decision",
                 "XY_TABLE provides its own column guide; DECISION_RULE uses the notes column for the formula",
+                "",
+                "",
+                "",
+                ""));
+        out.add(row7("NOTE", "layout",
+                "Rows start with LOGIT_SUMMARY (formerly Summary_Updated_Java), then blank lines, then STATS/SEASONS/SHAPES/WEIGHTS/XY_TABLE/DECISION_RULE.",
+                "",
+                "",
+                "",
+                ""));
+        out.add(row7("NOTE", "decision_table_filters",
+                "Decision_Table_Java.csv only keeps rows with samples > 358, margin_of_error_95 <= 0.0954, and empirical_flood_rate >= 0.5.",
                 "",
                 "",
                 "",
@@ -2044,14 +2057,17 @@ public class Data_Extraction_M1_Optimized {
                 double p = dc.empiricalFloodRate;
                 double n = dc.samples;
                 double se = Math.sqrt(p * (1.0 - p) / n);
+                double moe = 1.96 * se;
                 double ciLow = Math.max(0.0, p - 1.96 * se);
                 double ciHigh = Math.min(1.0, p + 1.96 * se);
                 dc.standardError = se;
+                dc.marginOfError95 = moe;
                 dc.ciLow95 = ciLow;
                 dc.ciHigh95 = ciHigh;
             } else {
                 dc.empiricalFloodRate = Double.NaN;
                 dc.standardError = Double.NaN;
+                dc.marginOfError95 = Double.NaN;
                 dc.ciLow95 = Double.NaN;
                 dc.ciHigh95 = Double.NaN;
             }
@@ -2123,6 +2139,7 @@ public class Data_Extraction_M1_Optimized {
                     "samples",
                     "empirical_flood_rate",
                     "standard_error",
+                    "margin_of_error_95",
                     "flood_rate_CI_low_95",
                     "flood_rate_CI_high_95",
                     "confidence_from_n",
@@ -2130,7 +2147,10 @@ public class Data_Extraction_M1_Optimized {
             ));
 
             for (DecisionCombo dc : combos) {
-                if (dc.empiricalFloodRate < 0.5) {
+                boolean passesFloodRate = dc.empiricalFloodRate >= 0.5;
+                boolean passesSample = dc.samples > 358; // strictly greater than 358
+                boolean passesMargin = !Double.isNaN(dc.marginOfError95) && dc.marginOfError95 <= 0.0954;
+                if (!(passesFloodRate && passesSample && passesMargin)) {
                     continue;
                 }
                 pw.println(String.join(",",
@@ -2141,6 +2161,7 @@ public class Data_Extraction_M1_Optimized {
                         Integer.toString(dc.samples),
                         Double.toString(dc.empiricalFloodRate),
                         Double.toString(dc.standardError),
+                        Double.toString(dc.marginOfError95),
                         Double.toString(dc.ciLow95),
                         Double.toString(dc.ciHigh95),
                         dc.confidenceFromN,
