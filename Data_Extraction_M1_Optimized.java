@@ -932,245 +932,712 @@ public class Data_Extraction_M1_Optimized {
     }
 
     private static List<List<String>> buildSummaryAllRows(List<ImageRecord> records) {
-        List<List<String>> rows = new ArrayList<>();
+        List<List<String>> out = new ArrayList<>();
 
-        rows.add(Collections.singletonList("COUNTS"));
-        rows.add(Arrays.asList("metric", "VV", "VH", "OTHER", "TOTAL"));
+        // Descriptive header:
+        List<String> header = new ArrayList<>();
+        header.add("section");
+        header.add("metric_name");
+        header.add("value_a");
+        header.add("value_b");
+        header.add("value_c");
+        header.add("value_d");
+        header.add("notes");
+        out.add(header);
 
-        Map<String, int[]> polCounts = new LinkedHashMap<>();
-        polCounts.put("total_images", new int[4]);
-        polCounts.put("flood_true", new int[4]);
-        polCounts.put("flood_false", new int[4]);
-
-        int idxVV = 0, idxVH = 1, idxOT = 2, idxTotal = 3;
-
-        for (ImageRecord rec : records) {
-            int idx;
-            if ("VV".equalsIgnoreCase(rec.polarization)) {
-                idx = idxVV;
-            } else if ("VH".equalsIgnoreCase(rec.polarization)) {
-                idx = idxVH;
-            } else {
-                idx = idxOT;
-            }
-
-            polCounts.get("total_images")[idx]++;
-            polCounts.get("total_images")[idxTotal]++;
-
-            if (rec.flooding) {
-                polCounts.get("flood_true")[idx]++;
-                polCounts.get("flood_true")[idxTotal]++;
-            } else {
-                polCounts.get("flood_false")[idx]++;
-                polCounts.get("flood_false")[idxTotal]++;
-            }
+        if (records.isEmpty()) {
+            out.add(row7("NOTE", "no_data", "", "", "", "",
+                    "No images produced data rows; summary is empty."));
+            return out;
         }
 
-        for (Map.Entry<String, int[]> e : polCounts.entrySet()) {
-            String metric = e.getKey();
-            int[] c = e.getValue();
-            rows.add(Arrays.asList(
-                    metric,
-                    Integer.toString(c[idxVV]),
-                    Integer.toString(c[idxVH]),
-                    Integer.toString(c[idxOT]),
-                    Integer.toString(c[idxTotal])
-            ));
-        }
+        out.addAll(buildStatsSection(records));
+        out.addAll(buildSeasonsSection(records));
+        out.addAll(buildShapesSection(records));
+        out.addAll(buildWeightsSection(records));
+        out.addAll(buildXYTableSection(records));
 
-        rows.add(Collections.emptyList());
+        List<String> ruleRow = new ArrayList<>();
+        ruleRow.add("DECISION_RULE");
+        ruleRow.add("score_formula");
+        ruleRow.add("");
+        ruleRow.add("");
+        ruleRow.add("");
+        ruleRow.add("");
+        ruleRow.add("score = w_raw*z_raw_mean + w_bd*z_black_diameter + w_wd*z_white_diameter + w_season + w_pol + w_black_shape + w_white_shape; z_feature = (x - mean_all)/std_all; P(FLOODING=true) = 1/(1+exp(-score)).");
+        out.add(ruleRow);
 
-        rows.add(Collections.singletonList("SEASONS"));
-        rows.add(Arrays.asList("season", "count", "flood_true", "flood_false", "true_rate"));
-
-        Map<String, int[]> seasonCounts = new LinkedHashMap<>();
-
-        for (ImageRecord rec : records) {
-            String season = (rec.season == null || rec.season.isEmpty()) ? "UNKNOWN" : rec.season;
-            int[] counts = seasonCounts.computeIfAbsent(season, s -> new int[3]);
-            counts[0]++;
-            if (rec.flooding) {
-                counts[1]++;
-            } else {
-                counts[2]++;
-            }
-        }
-
-        for (Map.Entry<String, int[]> e : seasonCounts.entrySet()) {
-            String season = e.getKey();
-            int[] c = e.getValue();
-            int count = c[0];
-            int floodTrue = c[1];
-            int floodFalse = c[2];
-            double trueRate = (count > 0) ? (double) floodTrue / (double) count : 0.0;
-            rows.add(Arrays.asList(
-                    season,
-                    Integer.toString(count),
-                    Integer.toString(floodTrue),
-                    Integer.toString(floodFalse),
-                    Double.toString(trueRate)
-            ));
-        }
-
-        rows.add(Collections.emptyList());
-
-        rows.add(Collections.singletonList("SHAPES"));
-        rows.add(Arrays.asList("shape_type", "shape_name", "count", "flood_true", "flood_false", "true_rate"));
-
-        Map<String, Map<String, int[]>> shapeCounts = new LinkedHashMap<>();
-        shapeCounts.put("black", new LinkedHashMap<>());
-        shapeCounts.put("white", new LinkedHashMap<>());
-
-        for (ImageRecord rec : records) {
-            String bShape = (rec.blackShape == null || rec.blackShape.isEmpty()) ? "none" : rec.blackShape;
-            String wShape = (rec.whiteShape == null || rec.whiteShape.isEmpty()) ? "none" : rec.whiteShape;
-
-            int[] bCounts = shapeCounts.get("black").computeIfAbsent(bShape, s -> new int[3]);
-            int[] wCounts = shapeCounts.get("white").computeIfAbsent(wShape, s -> new int[3]);
-
-            bCounts[0]++;
-            wCounts[0]++;
-
-            if (rec.flooding) {
-                bCounts[1]++;
-                wCounts[1]++;
-            } else {
-                bCounts[2]++;
-                wCounts[2]++;
-            }
-        }
-
-        for (Map.Entry<String, Map<String, int[]>> eType : shapeCounts.entrySet()) {
-            String type = eType.getKey();
-            for (Map.Entry<String, int[]> eShape : eType.getValue().entrySet()) {
-                String shape = eShape.getKey();
-                int[] c = eShape.getValue();
-                int count = c[0];
-                int floodTrue = c[1];
-                int floodFalse = c[2];
-                double trueRate = (count > 0) ? (double) floodTrue / (double) count : 0.0;
-
-                rows.add(Arrays.asList(
-                        type,
-                        shape,
-                        Integer.toString(count),
-                        Integer.toString(floodTrue),
-                        Integer.toString(floodFalse),
-                        Double.toString(trueRate)
-                ));
-            }
-        }
-
-        rows.add(Collections.emptyList());
-
-        rows.add(Collections.singletonList("WEIGHTS"));
-        rows.add(Arrays.asList("feature", "weight"));
-
-        Map<Integer, Long> globalRawCounts = new TreeMap<>();
-        for (ImageRecord rec : records) {
-            for (Map.Entry<String, Integer> e : rec.rawCounts.entrySet()) {
-                String key = e.getKey();
-                if (!key.startsWith("RAW_")) continue;
-                String numStr = key.substring(4);
-                int rawVal;
-                try {
-                    rawVal = Integer.parseInt(numStr);
-                } catch (NumberFormatException ex) {
-                    continue;
-                }
-                int count = e.getValue();
-                if (count <= 0) continue;
-                long current = globalRawCounts.getOrDefault(rawVal, 0L);
-                globalRawCounts.put(rawVal, current + count);
-            }
-        }
-
-        rows.add(Arrays.asList("raw_mean", "1.0"));
-        rows.add(Arrays.asList("black_diameter", "1.0"));
-        rows.add(Arrays.asList("white_diameter", "1.0"));
-
-        rows.add(Collections.emptyList());
-
-        rows.add(Collections.singletonList("XY_TABLE"));
-        rows.add(Arrays.asList("season", "polarization", "black_shape", "white_shape", "count", "flood_true", "true_rate"));
-
-        Map<String, Map<String, Map<String, Map<String, int[]>>>> xy = new LinkedHashMap<>();
-
-        List<Double> rawMeans = new ArrayList<>();
-        for (ImageRecord rec : records) {
-            rawMeans.add(rec.rawMean);
-        }
-        double overallMean = 0.0;
-        for (double v : rawMeans) {
-            overallMean += v;
-        }
-        overallMean = (rawMeans.isEmpty()) ? 0.0 : (overallMean / rawMeans.size());
-
-        double overallVar = 0.0;
-        for (double v : rawMeans) {
-            double diff = v - overallMean;
-            overallVar += diff * diff;
-        }
-        overallVar = (rawMeans.size() > 1) ? (overallVar / (rawMeans.size() - 1)) : 0.0;
-        double overallStd = (overallVar > 0.0) ? Math.sqrt(overallVar) : 1.0;
-
-        for (ImageRecord rec : records) {
-            double z = (rec.rawMean - overallMean) / overallStd;
-            if (Math.abs(z) > 1.0) continue;
-
-            String season = (rec.season == null || rec.season.isEmpty()) ? "UNKNOWN" : rec.season;
-            String pol = (rec.polarization == null || rec.polarization.isEmpty()) ? "OTHER" : rec.polarization;
-            String bShape = (rec.blackShape == null || rec.blackShape.isEmpty()) ? "none" : rec.blackShape;
-            String wShape = (rec.whiteShape == null || rec.whiteShape.isEmpty()) ? "none" : rec.whiteShape;
-
-            xy.computeIfAbsent(season, s -> new LinkedHashMap<>())
-                    .computeIfAbsent(pol, s -> new LinkedHashMap<>())
-                    .computeIfAbsent(bShape, s -> new LinkedHashMap<>())
-                    .computeIfAbsent(wShape, s -> new int[3]);
-
-            int[] c = xy.get(season).get(pol).get(bShape).get(wShape);
-            c[0]++;
-            if (rec.flooding) c[1]++;
-        }
-
-        for (Map.Entry<String, Map<String, Map<String, Map<String, int[]>>>> eSeason : xy.entrySet()) {
-            String season = eSeason.getKey();
-            for (Map.Entry<String, Map<String, Map<String, int[]>>> ePol : eSeason.getValue().entrySet()) {
-                String pol = ePol.getKey();
-                for (Map.Entry<String, Map<String, int[]>> eBlack : ePol.getValue().entrySet()) {
-                    String bShape = eBlack.getKey();
-                    for (Map.Entry<String, int[]> eWhite : eBlack.getValue().entrySet()) {
-                        String wShape = eWhite.getKey();
-                        int[] c = eWhite.getValue();
-                        int count = c[0];
-                        int floodTrue = c[1];
-                        double trueRate = (count > 0) ? (double) floodTrue / (double) count : 0.0;
-
-                        rows.add(Arrays.asList(
-                                season,
-                                pol,
-                                bShape,
-                                wShape,
-                                Integer.toString(count),
-                                Integer.toString(floodTrue),
-                                Double.toString(trueRate)
-                        ));
-                    }
-                }
-            }
-        }
-
-        rows.add(Collections.emptyList());
-
-        rows.add(Collections.singletonList("DECISION_RULE"));
-        rows.add(Arrays.asList(
-                "Interpretation",
-                "Score = w_raw_mean * (raw_mean - overall_mean)/overall_std + w_black_diam * black_diameter + w_white_diam * white_diameter + ...; Probability = 1 / (1 + exp(-Score))"
-        ));
-
-        return rows;
+        return out;
     }
 
+    // ---------- STATS section (post-mode from RAW pixel counts, skipping RAW_00000) ----------
+
+    private static List<List<String>> buildStatsSection(List<ImageRecord> records) {
+        List<List<String>> out = new ArrayList<>();
+
+        List<Double> valsTrueAll = new ArrayList<>();
+        List<Double> valsFalseAll = new ArrayList<>();
+
+        for (ImageRecord rec : records) {
+            if (rec.flooding) valsTrueAll.add(rec.rawMean);
+            else valsFalseAll.add(rec.rawMean);
+        }
+
+        int nTrueAll = valsTrueAll.size();
+        int nFalseAll = valsFalseAll.size();
+
+        double meanTrueAll = mean(valsTrueAll);
+        double meanFalseAll = mean(valsFalseAll);
+        double stdTrueAll = stddev(valsTrueAll, meanTrueAll);
+        double stdFalseAll = stddev(valsFalseAll, meanFalseAll);
+
+        // 3-sigma outlier removal (per group) for post-mean stats
+        List<Double> valsTrueNo = filterByZScore(valsTrueAll, meanTrueAll, stdTrueAll, 3.0);
+        List<Double> valsFalseNo = filterByZScore(valsFalseAll, meanFalseAll, stdFalseAll, 3.0);
+
+        int nTrueNo = valsTrueNo.size();
+        int nFalseNo = valsFalseNo.size();
+
+        double meanTrueNo = mean(valsTrueNo);
+        double meanFalseNo = mean(valsFalseNo);
+        double stdTrueNo = stddev(valsTrueNo, meanTrueNo);
+        double stdFalseNo = stddev(valsFalseNo, meanFalseNo);
+
+        // For median, ignore raw_mean == 0.0 after outlier removal so background-only cases do not dominate.
+        List<Double> valsTrueNoNoZero = removeZeros(valsTrueNo);
+        List<Double> valsFalseNoNoZero = removeZeros(valsFalseNo);
+
+        double medianTrueNo = median(valsTrueNoNoZero);
+        double medianFalseNo = median(valsFalseNoNoZero);
+
+        double cohensDNo = cohenD(meanTrueNo, stdTrueNo, nTrueNo, meanFalseNo, stdFalseNo, nFalseNo);
+
+        String medianTrueStr = valsTrueNoNoZero.isEmpty() ? "" : Double.toString(medianTrueNo);
+        String medianFalseStr = valsFalseNoNoZero.isEmpty() ? "" : Double.toString(medianFalseNo);
+
+        // Compute mode from RAW pixel counts across post-mean images, skipping RAW_00000 entirely.
+        Map<Integer, Long> rawCountsTrue = new HashMap<>();
+        Map<Integer, Long> rawCountsFalse = new HashMap<>();
+
+        double thrTrue = (stdTrueAll == 0.0) ? Double.POSITIVE_INFINITY : 3.0 * stdTrueAll;
+        double thrFalse = (stdFalseAll == 0.0) ? Double.POSITIVE_INFINITY : 3.0 * stdFalseAll;
+
+        for (ImageRecord rec : records) {
+            if (rec.flooding) {
+                if (Math.abs(rec.rawMean - meanTrueAll) > thrTrue) {
+                    continue; // outlier
+                }
+                accumulateRawCounts(rec, rawCountsTrue);
+            } else {
+                if (Math.abs(rec.rawMean - meanFalseAll) > thrFalse) {
+                    continue; // outlier
+                }
+                accumulateRawCounts(rec, rawCountsFalse);
+            }
+        }
+
+        Integer modeRawTrue = findModeRaw(rawCountsTrue, true);
+        Integer modeRawFalse = findModeRaw(rawCountsFalse, true);
+
+        String modeTrueStr = (modeRawTrue == null) ? "" : Integer.toString(modeRawTrue);
+        String modeFalseStr = (modeRawFalse == null) ? "" : Integer.toString(modeRawFalse);
+
+        out.add(row7("STATS", "count_images_all",
+                Integer.toString(nTrueAll),
+                Integer.toString(nFalseAll),
+                "",
+                "",
+                "True/false image counts, pre-mean (no outlier removal)."));
+
+        out.add(row7("STATS", "count_images_post_mean",
+                Integer.toString(nTrueNo),
+                Integer.toString(nFalseNo),
+                "",
+                "",
+                "Images retained for post-mean (|x-mean| <= 3*std within each group)."));
+
+        out.add(row7("STATS", "mean_raw_pre",
+                Double.toString(meanTrueAll),
+                Double.toString(meanFalseAll),
+                "",
+                "",
+                "Pre-mean raw_mean across all images (zeros included)."));
+
+        out.add(row7("STATS", "std_raw_pre",
+                Double.toString(stdTrueAll),
+                Double.toString(stdFalseAll),
+                "",
+                "",
+                "Pre-std raw_mean across all images."));
+
+        out.add(row7("STATS", "post_mean_raw",
+                Double.toString(meanTrueNo),
+                Double.toString(meanFalseNo),
+                "",
+                "",
+                "Post-mean raw_mean after 3-sigma outlier removal (zeros included)."));
+
+        out.add(row7("STATS", "post_std_raw",
+                Double.toString(stdTrueNo),
+                Double.toString(stdFalseNo),
+                "",
+                "",
+                "Post-std raw_mean after 3-sigma outlier removal."));
+
+        out.add(row7("STATS", "post_median_raw",
+                medianTrueStr,
+                medianFalseStr,
+                "",
+                "",
+                "Post-median raw_mean after 3-sigma removal; zeros excluded from median calculation."));
+
+        out.add(row7("STATS", "post_mode_raw",
+                modeTrueStr,
+                modeFalseStr,
+                "",
+                "",
+                "Post-mode RAW value: RAW sample whose total pixel count is highest across post-mean images in each group; zero-count RAW values are ignored and RAW=0 is skipped."));
+
+        out.add(row7("STATS", "cohens_d_post_mean_raw",
+                Double.toString(cohensDNo),
+                "",
+                "",
+                "",
+                "Effect size on post-mean data: (mean_true - mean_false) / pooled_std."));
+
+        return out;
+    }
+
+    private static void accumulateRawCounts(ImageRecord rec, Map<Integer, Long> accumulator) {
+        for (Map.Entry<String, Integer> e : rec.rawCounts.entrySet()) {
+            String key = e.getKey();
+            if (!key.startsWith("RAW_")) continue;
+            String numStr = key.substring(4);
+            int rawVal;
+            try {
+                rawVal = Integer.parseInt(numStr);
+            } catch (NumberFormatException ex) {
+                continue;
+            }
+            if (rawVal == 0) continue; // skip RAW_00000 entirely for stats
+            int count = e.getValue();
+            if (count <= 0) continue;
+            long current = accumulator.getOrDefault(rawVal, 0L);
+            accumulator.put(rawVal, current + count);
+        }
+    }
+
+    private static Integer findModeRaw(Map<Integer, Long> counts, boolean disallowZeroRaw) {
+        Integer bestRaw = null;
+        long bestCount = 0L;
+        for (Map.Entry<Integer, Long> e : counts.entrySet()) {
+            int raw = e.getKey();
+            long c = e.getValue();
+            if (c <= 0L) continue;
+            if (disallowZeroRaw && raw == 0) continue; // skip RAW=0 when requested
+            if (bestRaw == null || c > bestCount || (c == bestCount && raw < bestRaw)) {
+                bestCount = c;
+                bestRaw = raw;
+            }
+        }
+        return bestRaw;
+    }
+
+    private static List<String> row7(String section, String name,
+                                     String v1, String v2, String v3, String v4, String notes) {
+        List<String> r = new ArrayList<>();
+        r.add(section);
+        r.add(name);
+        r.add(v1 == null ? "" : v1);
+        r.add(v2 == null ? "" : v2);
+        r.add(v3 == null ? "" : v3);
+        r.add(v4 == null ? "" : v4);
+        r.add(notes == null ? "" : notes);
+        return r;
+    }
+
+    // ---------- SEASONS section ----------
+
+    private static List<List<String>> buildSeasonsSection(List<ImageRecord> records) {
+        List<List<String>> out = new ArrayList<>();
+
+        Map<String, Integer> trueCounts = new HashMap<>();
+        Map<String, Integer> falseCounts = new HashMap<>();
+
+        for (ImageRecord rec : records) {
+            String season = (rec.season == null || rec.season.isEmpty()) ? "Unknown" : rec.season;
+            if (rec.flooding) {
+                trueCounts.put(season, trueCounts.getOrDefault(season, 0) + 1);
+            } else {
+                falseCounts.put(season, falseCounts.getOrDefault(season, 0) + 1);
+            }
+        }
+
+        String[] seasons = new String[]{"Winter", "Spring", "Summer", "Autumn", "Unknown"};
+        for (String s : seasons) {
+            int ct = trueCounts.getOrDefault(s, 0);
+            int cf = falseCounts.getOrDefault(s, 0);
+            int total = ct + cf;
+            double rate = (total > 0) ? ((double) ct / (double) total) : 0.0;
+            out.add(row7("SEASONS", s,
+                    Integer.toString(ct),
+                    Integer.toString(cf),
+                    Double.toString(rate),
+                    "",
+                    "True_rate = count_true / (count_true + count_false) for this season."));
+        }
+
+        return out;
+    }
+
+    // ---------- SHAPES section ----------
+
+    private static List<List<String>> buildShapesSection(List<ImageRecord> records) {
+        List<List<String>> out = new ArrayList<>();
+
+        Map<String, Integer> blackTrue = new HashMap<>();
+        Map<String, Integer> blackFalse = new HashMap<>();
+        Map<String, Integer> whiteTrue = new HashMap<>();
+        Map<String, Integer> whiteFalse = new HashMap<>();
+
+        for (ImageRecord rec : records) {
+            String bShape = (rec.blackShape == null || rec.blackShape.isEmpty()) ? "none" : rec.blackShape;
+            String wShape = (rec.whiteShape == null || rec.whiteShape.isEmpty()) ? "none" : rec.whiteShape;
+            if (rec.flooding) {
+                blackTrue.put(bShape, blackTrue.getOrDefault(bShape, 0) + 1);
+                whiteTrue.put(wShape, whiteTrue.getOrDefault(wShape, 0) + 1);
+            } else {
+                blackFalse.put(bShape, blackFalse.getOrDefault(bShape, 0) + 1);
+                whiteFalse.put(wShape, whiteFalse.getOrDefault(wShape, 0) + 1);
+            }
+        }
+
+        out.add(row7("SHAPES", "NOTE",
+                "",
+                "",
+                "",
+                "",
+                "Each image contributes one black and one white largest component (after filters and fallback)."));
+
+        Set<String> allShapesBlack = new TreeSet<>(blackTrue.keySet());
+        allShapesBlack.addAll(blackFalse.keySet());
+        for (String s : allShapesBlack) {
+            int ct = blackTrue.getOrDefault(s, 0);
+            int cf = blackFalse.getOrDefault(s, 0);
+            out.add(row7("SHAPES", "black_" + s,
+                    Integer.toString(ct),
+                    Integer.toString(cf),
+                    "",
+                    "",
+                    "Largest black-component shape = " + s));
+        }
+
+        Set<String> allShapesWhite = new TreeSet<>(whiteTrue.keySet());
+        allShapesWhite.addAll(whiteFalse.keySet());
+        for (String s : allShapesWhite) {
+            int ct = whiteTrue.getOrDefault(s, 0);
+            int cf = whiteFalse.getOrDefault(s, 0);
+            out.add(row7("SHAPES", "white_" + s,
+                    Integer.toString(ct),
+                    Integer.toString(cf),
+                    "",
+                    "",
+                    "Largest white-component shape = " + s));
+        }
+
+        return out;
+    }
+
+    // ---------- WEIGHTS section (numeric + season + shape + polarization) ----------
+
+    private static List<List<String>> buildWeightsSection(List<ImageRecord> records) {
+        List<List<String>> out = new ArrayList<>();
+        WeightContext ctx = computeWeights(records);
+
+        out.add(row7("WEIGHTS", "raw_mean",
+                Double.toString(ctx.wRaw),
+                Double.toString(ctx.meanRawAll),
+                Double.toString(ctx.stdRawAll),
+                "",
+                "Numeric weight: Cohen's d on raw_mean."));
+
+        out.add(row7("WEIGHTS", "black_diameter",
+                Double.toString(ctx.wBd),
+                Double.toString(ctx.meanBdAll),
+                Double.toString(ctx.stdBdAll),
+                "",
+                "Numeric weight: Cohen's d on black diameter."));
+
+        out.add(row7("WEIGHTS", "white_diameter",
+                Double.toString(ctx.wWd),
+                Double.toString(ctx.meanWdAll),
+                Double.toString(ctx.stdWdAll),
+                "",
+                "Numeric weight: Cohen's d on white diameter."));
+
+        for (Map.Entry<String, Double> e : ctx.seasonWeight.entrySet()) {
+            String s = e.getKey();
+            double w = e.getValue();
+            out.add(row7("WEIGHTS", "season_" + s,
+                    Double.toString(w),
+                    "",
+                    Double.toString(ctx.overallTrueRate),
+                    "",
+                    "Season weight = true_rate(season) - overall_true_rate."));
+        }
+
+        for (Map.Entry<String, Double> e : ctx.polWeight.entrySet()) {
+            String pol = e.getKey();
+            double w = e.getValue();
+            out.add(row7("WEIGHTS", "pol_" + pol,
+                    Double.toString(w),
+                    "",
+                    Double.toString(ctx.overallTrueRate),
+                    "",
+                    "Polarization weight = true_rate(pol) - overall_true_rate."));
+        }
+
+        for (Map.Entry<String, Double> e : ctx.blackShapeWeight.entrySet()) {
+            String s = e.getKey();
+            double w = e.getValue();
+            out.add(row7("WEIGHTS", "black_shape_" + s,
+                    Double.toString(w),
+                    "",
+                    Double.toString(ctx.overallTrueRate),
+                    "",
+                    "Black shape weight = true_rate(shape) - overall_true_rate."));
+        }
+
+        for (Map.Entry<String, Double> e : ctx.whiteShapeWeight.entrySet()) {
+            String s = e.getKey();
+            double w = e.getValue();
+            out.add(row7("WEIGHTS", "white_shape_" + s,
+                    Double.toString(w),
+                    "",
+                    Double.toString(ctx.overallTrueRate),
+                    "",
+                    "White shape weight = true_rate(shape) - overall_true_rate."));
+        }
+
+        return out;
+    }
+
+    private static class WeightContext {
+        double overallTrueRate;
+        double wRaw, meanRawAll, stdRawAll;
+        double wBd, meanBdAll, stdBdAll;
+        double wWd, meanWdAll, stdWdAll;
+        Map<String, Double> seasonWeight = new HashMap<>();
+        Map<String, Double> polWeight = new HashMap<>();
+        Map<String, Double> blackShapeWeight = new HashMap<>();
+        Map<String, Double> whiteShapeWeight = new HashMap<>();
+    }
+
+    private static WeightContext computeWeights(List<ImageRecord> records) {
+        WeightContext ctx = new WeightContext();
+
+        int totalTrue = 0, totalFalse = 0;
+        for (ImageRecord rec : records) {
+            if (rec.flooding) totalTrue++;
+            else totalFalse++;
+        }
+        ctx.overallTrueRate = (totalTrue + totalFalse > 0)
+                ? ((double) totalTrue / (double) (totalTrue + totalFalse))
+                : 0.0;
+
+        List<Double> rawTrue = new ArrayList<>();
+        List<Double> rawFalse = new ArrayList<>();
+        List<Double> rawAll = new ArrayList<>();
+
+        List<Double> bdTrue = new ArrayList<>();
+        List<Double> bdFalse = new ArrayList<>();
+        List<Double> bdAll = new ArrayList<>();
+
+        List<Double> wdTrue = new ArrayList<>();
+        List<Double> wdFalse = new ArrayList<>();
+        List<Double> wdAll = new ArrayList<>();
+
+        for (ImageRecord rec : records) {
+            double rm = rec.rawMean;
+            double bd = rec.blackDiameter;
+            double wd = rec.whiteDiameter;
+
+            rawAll.add(rm);
+            bdAll.add(bd);
+            wdAll.add(wd);
+
+            if (rec.flooding) {
+                rawTrue.add(rm);
+                bdTrue.add(bd);
+                wdTrue.add(wd);
+            } else {
+                rawFalse.add(rm);
+                bdFalse.add(bd);
+                wdFalse.add(wd);
+            }
+        }
+
+        ctx.meanRawAll = mean(rawAll);
+        ctx.stdRawAll = stddev(rawAll, ctx.meanRawAll);
+        double meanRawTrue = mean(rawTrue);
+        double meanRawFalse = mean(rawFalse);
+        double sdRawTrue = stddev(rawTrue, meanRawTrue);
+        double sdRawFalse = stddev(rawFalse, meanRawFalse);
+        ctx.wRaw = cohenD(meanRawTrue, sdRawTrue, rawTrue.size(),
+                meanRawFalse, sdRawFalse, rawFalse.size());
+
+        ctx.meanBdAll = mean(bdAll);
+        ctx.stdBdAll = stddev(bdAll, ctx.meanBdAll);
+        double meanBdTrue = mean(bdTrue);
+        double meanBdFalse = mean(bdFalse);
+        double sdBdTrue = stddev(bdTrue, meanBdTrue);
+        double sdBdFalse = stddev(bdFalse, meanBdFalse);
+        ctx.wBd = cohenD(meanBdTrue, sdBdTrue, bdTrue.size(),
+                meanBdFalse, sdBdFalse, bdFalse.size());
+
+        ctx.meanWdAll = mean(wdAll);
+        ctx.stdWdAll = stddev(wdAll, ctx.meanWdAll);
+        double meanWdTrue = mean(wdTrue);
+        double meanWdFalse = mean(wdFalse);
+        double sdWdTrue = stddev(wdTrue, meanWdTrue);
+        double sdWdFalse = stddev(wdFalse, meanWdFalse);
+        ctx.wWd = cohenD(meanWdTrue, sdWdTrue, wdTrue.size(),
+                meanWdFalse, sdWdFalse, wdFalse.size());
+
+        // Season weights
+        Map<String, Integer> seasonTrue = new HashMap<>();
+        Map<String, Integer> seasonFalse = new HashMap<>();
+        for (ImageRecord rec : records) {
+            String s = (rec.season == null || rec.season.isEmpty()) ? "Unknown" : rec.season;
+            if (rec.flooding) seasonTrue.put(s, seasonTrue.getOrDefault(s, 0) + 1);
+            else seasonFalse.put(s, seasonFalse.getOrDefault(s, 0) + 1);
+        }
+        String[] seasons = new String[]{"Winter", "Spring", "Summer", "Autumn", "Unknown"};
+        int minSeasonCount = 30; // below this, treat weight as 0 (insufficient evidence)
+        for (String s : seasons) {
+            int ct = seasonTrue.getOrDefault(s, 0);
+            int cf = seasonFalse.getOrDefault(s, 0) + 1; // +1 for slight smoothing
+            int total = ct + cf;
+            if (total == 0) continue;
+            if (total < minSeasonCount) {
+                ctx.seasonWeight.put(s, 0.0);
+                continue;
+            }
+            double rate = (double) ct / (double) total;
+            ctx.seasonWeight.put(s, rate - ctx.overallTrueRate);
+        }
+
+        // Polarization weights
+        Map<String, Integer> polTrue = new HashMap<>();
+        Map<String, Integer> polFalse = new HashMap<>();
+        for (ImageRecord rec : records) {
+            String p = rec.polarization == null ? "OTHER" : rec.polarization;
+            if (rec.flooding) polTrue.put(p, polTrue.getOrDefault(p, 0) + 1);
+            else polFalse.put(p, polFalse.getOrDefault(p, 0) + 1);
+        }
+        Set<String> allPol = new TreeSet<>(polTrue.keySet());
+        allPol.addAll(polFalse.keySet());
+        for (String p : allPol) {
+            int ct = polTrue.getOrDefault(p, 0);
+            int cf = polFalse.getOrDefault(p, 0) + 1; // +1 smoothing
+            int total = ct + cf;
+            if (total == 0) continue;
+            double rate = (double) ct / (double) total;
+            ctx.polWeight.put(p, rate - ctx.overallTrueRate);
+        }
+
+        // Shape weights
+        Map<String, Integer> blackTrue = new HashMap<>();
+        Map<String, Integer> blackFalse = new HashMap<>();
+        Map<String, Integer> whiteTrue = new HashMap<>();
+        Map<String, Integer> whiteFalse = new HashMap<>();
+        for (ImageRecord rec : records) {
+            String b = (rec.blackShape == null || rec.blackShape.isEmpty()) ? "none" : rec.blackShape;
+            String w = (rec.whiteShape == null || rec.whiteShape.isEmpty()) ? "none" : rec.whiteShape;
+            if (rec.flooding) {
+                blackTrue.put(b, blackTrue.getOrDefault(b, 0) + 1);
+                whiteTrue.put(w, whiteTrue.getOrDefault(w, 0) + 1);
+            } else {
+                blackFalse.put(b, blackFalse.getOrDefault(b, 0) + 1);
+                whiteFalse.put(w, whiteFalse.getOrDefault(w, 0) + 1);
+            }
+        }
+        Set<String> allB = new TreeSet<>(blackTrue.keySet());
+        allB.addAll(blackFalse.keySet());
+        for (String s : allB) {
+            int ct = blackTrue.getOrDefault(s, 0);
+            int cf = blackFalse.getOrDefault(s, 0) + 1; // smoothing
+            int total = ct + cf;
+            if (total == 0) continue;
+            double rate = (double) ct / (double) total;
+            ctx.blackShapeWeight.put(s, rate - ctx.overallTrueRate);
+        }
+
+        Set<String> allW = new TreeSet<>(whiteTrue.keySet());
+        allW.addAll(whiteFalse.keySet());
+        for (String s : allW) {
+            int ct = whiteTrue.getOrDefault(s, 0);
+            int cf = whiteFalse.getOrDefault(s, 0) + 1; // smoothing
+            int total = ct + cf;
+            if (total == 0) continue;
+            double rate = (double) ct / (double) total;
+            ctx.whiteShapeWeight.put(s, rate - ctx.overallTrueRate);
+        }
+
+        return ctx;
+    }
+
+    // ---------- XY_TABLE section (empirical probability by season/pol/shapes within |z_raw_mean| <= 1) ----------
+
+    private static List<List<String>> buildXYTableSection(List<ImageRecord> records) {
+        List<List<String>> out = new ArrayList<>();
+
+        out.add(row7(
+                "XY_TABLE", "COLUMNS",
+                "total_images",
+                "prob_true_percent",
+                "count_true",
+                "count_false",
+                "For XY_TABLE rows: metric_name encodes season, polarization, black_shape, white_shape; value_a = total images in this combination (within |z_raw_mean| <= 1), value_b = P(FLOODING=true)%, value_c = number of true-labelled images, value_d = number of false-labelled images."));
+
+        if (records.isEmpty()) {
+            return out;
+        }
+
+        double sum = 0.0;
+        double sumSq = 0.0;
+        int n = 0;
+        for (ImageRecord r : records) {
+            double v = r.rawMean;
+            if (Double.isNaN(v)) continue;
+            sum += v;
+            sumSq += v * v;
+            n++;
+        }
+        if (n == 0) {
+            return out;
+        }
+        double mean = sum / n;
+        double var = (sumSq / n) - (mean * mean);
+        double std = var > 0.0 ? Math.sqrt(var) : 0.0;
+        if (std == 0.0) {
+            return out;
+        }
+
+        double zThreshold = 1.0; // within one std dev of overall mean
+
+        Map<String, int[]> comboCounts = new TreeMap<>();
+        for (ImageRecord r : records) {
+            double v = r.rawMean;
+            if (Double.isNaN(v)) continue;
+            double z = (v - mean) / std;
+            if (Math.abs(z) > zThreshold) continue;
+
+            String season = (r.season == null || r.season.isEmpty()) ? "Unknown" : r.season;
+            String pol = (r.polarization == null) ? "" : r.polarization;
+
+            String bs = (r.blackShape == null || r.blackShape.isEmpty())
+                    ? "none" : r.blackShape;
+
+            String ws = (r.whiteShape == null || r.whiteShape.isEmpty())
+                    ? "none" : r.whiteShape;
+
+            String key = "season=" + season + ",pol=" + pol +
+                    ",black_shape=" + bs + ",white_shape=" + ws;
+
+            int[] counts = comboCounts.get(key);
+            if (counts == null) {
+                counts = new int[]{0, 0}; // [false, true]
+                comboCounts.put(key, counts);
+            }
+            if (r.flooding) {
+                counts[1]++;
+            } else {
+                counts[0]++;
+            }
+        }
+
+        int minComboCount = 10; // only show combinations with enough data
+        for (Map.Entry<String, int[]> e : comboCounts.entrySet()) {
+            String key = e.getKey();
+            int[] counts = e.getValue();
+            int cFalse = counts[0];
+            int cTrue = counts[1];
+            int total = cFalse + cTrue;
+            if (total < minComboCount) continue;
+
+            double prob = (total > 0) ? ((double) cTrue / (double) total) * 100.0 : 0.0;
+            out.add(row7(
+                    "XY_TABLE", key,
+                    Integer.toString(total),
+                    Double.toString(prob),
+                    Integer.toString(cTrue),
+                    Integer.toString(cFalse),
+                    ""));
+        }
+
+        return out;
+    }
+
+    // ---------- basic stats helpers ----------
+
+    private static double mean(List<Double> vals) {
+        int n = vals.size();
+        if (n == 0) return 0.0;
+        double s = 0.0;
+        for (double v : vals) s += v;
+        return s / n;
+    }
+
+    private static double stddev(List<Double> vals, double mean) {
+        int n = vals.size();
+        if (n <= 1) return 0.0;
+        double s2 = 0.0;
+        for (double v : vals) {
+            double d = v - mean;
+            s2 += d * d;
+        }
+        return Math.sqrt(s2 / n);
+    }
+
+    private static List<Double> filterByZScore(List<Double> vals, double mean, double std, double z) {
+        if (vals.isEmpty() || std == 0.0) return new ArrayList<>(vals);
+        List<Double> out = new ArrayList<>();
+        double thr = z * std;
+        for (double v : vals) {
+            if (Math.abs(v - mean) <= thr) out.add(v);
+        }
+        return out;
+    }
+
+    private static double median(List<Double> vals) {
+        int n = vals.size();
+        if (n == 0) return 0.0;
+        List<Double> copy = new ArrayList<>(vals);
+        Collections.sort(copy);
+        if (n % 2 == 1) return copy.get(n / 2);
+        return 0.5 * (copy.get(n / 2 - 1) + copy.get(n / 2));
+    }
+
+    private static List<Double> removeZeros(List<Double> vals) {
+        List<Double> out = new ArrayList<>();
+        for (double v : vals) {
+            if (v != 0.0) {
+                out.add(v);
+            }
+        }
+        return out;
+    }
+
+    private static double cohenD(double mean1, double std1, int n1,
+                                 double mean2, double std2, int n2) {
+        if (n1 < 2 || n2 < 2) return 0.0;
+        double var1 = std1 * std1;
+        double var2 = std2 * std2;
+        double pooled = Math.sqrt(((n1 - 1) * var1 + (n2 - 1) * var2) / (double) (n1 + n2 - 2));
+        if (pooled == 0.0) return 0.0;
+        return (mean1 - mean2) / pooled;
+    }
     private static List<List<String>> buildSkippedRows(List<SkipRecord> skips) {
         List<List<String>> rows = new ArrayList<>();
         rows.add(Arrays.asList("image_name", "folder_name", "reason"));
