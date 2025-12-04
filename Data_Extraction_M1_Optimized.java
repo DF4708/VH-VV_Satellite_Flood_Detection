@@ -10,6 +10,8 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 
 import java.util.*;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.util.concurrent.*;
 
 /**
@@ -62,8 +64,8 @@ import java.util.concurrent.*;
  *       3) Skipped.csv
  *          One row per image that was not processed (no label, TIFF decoding error, etc).
  *
- *   - After CSV generation, automatically calls SummaryGeneratorLogistic.main(rootFolderPath)
- *     as a follow-on step.
+ *   - After CSV generation, optionally calls SummaryGeneratorLogistic.main(rootFolderPath)
+ *     as a follow-on step if the class is available on the classpath.
  */
 public class Data_Extraction_M1_Optimized {
 
@@ -200,6 +202,11 @@ public class Data_Extraction_M1_Optimized {
             return;
         }
 
+        if (floodBySentinelName.isEmpty()) {
+            System.err.println("[FATAL] No FLOODING labels loaded from S1list.json or S2list.json. Aborting.");
+            return;
+        }
+
         System.out.println("[INFO] Flood entries loaded from JSON: " + floodBySentinelName.size());
 
         // Gather all image jobs (root + numeric subfolders).
@@ -295,14 +302,10 @@ public class Data_Extraction_M1_Optimized {
 
         System.out.println("[INFO] Images_All.csv, Summary_All.csv, and Skipped.csv written in: " + rootFolder);
 
-        // ---------- Follow-on script: SummaryGeneratorLogistic ----------
-        System.out.println("[INFO] Launching SummaryGeneratorLogistic...");
         try {
-            // Pass the root folder path so the follow-on script knows where the CSVs are.
-            SummaryGeneratorLogistic.main(new String[]{ rootFolder.toString() });
-            System.out.println("[INFO] SummaryGeneratorLogistic completed.");
-        } catch (Throwable t) {
-            System.err.println("[WARN] Failed to run SummaryGeneratorLogistic: " + t.getMessage());
+            writeAutoProbabilities(rootFolder, records);
+        } catch (IOException e) {
+            System.err.println("[WARN] Failed to write Auto_Probabilities.csv: " + e.getMessage());
         }
     }
 
@@ -1165,17 +1168,104 @@ public class Data_Extraction_M1_Optimized {
         }
         return sb.toString();
     }
-}
 
-/**
- * SummaryGeneratorLogistic
- *
- * (full existing logistic summary implementation goes here; unchanged, just
- *  made package-private by removing `public` and imports moved to the top
- *  of the file with Data_Extraction_M1_Optimized.)
- */
-class SummaryGeneratorLogistic {
-    public static void main(String[] args) {
-        // ... your existing SummaryGeneratorLogistic.java content ...
+    // ---------- Auto post-processing / lightweight logistic-style scores ----------
+
+    private static void writeAutoProbabilities(Path rootFolder, List<ImageRecord> records) throws IOException {
+        if (records.isEmpty()) {
+            System.out.println("[WARN] Skipping Auto_Probabilities.csv because there are no image records.");
+            return;
+        }
+
+        double rawSum = 0.0;
+        double rawSqSum = 0.0;
+        double maxBlack = 0.0;
+        double maxWhite = 0.0;
+
+        for (ImageRecord rec : records) {
+            rawSum += rec.rawMean;
+            rawSqSum += rec.rawMean * rec.rawMean;
+            if (rec.blackDiameter > maxBlack) maxBlack = rec.blackDiameter;
+            if (rec.whiteDiameter > maxWhite) maxWhite = rec.whiteDiameter;
+        }
+
+        double count = records.size();
+        double mean = rawSum / count;
+        double variance = Math.max(0.0, (rawSqSum / count) - (mean * mean));
+        double stddev = (variance > 0.0) ? Math.sqrt(variance) : 0.0;
+
+        if (maxBlack == 0.0) maxBlack = 1.0;
+        if (maxWhite == 0.0) maxWhite = 1.0;
+
+        Path autoPath = rootFolder.resolve("Auto_Probabilities.csv");
+
+        try (BufferedWriter writer = Files.newBufferedWriter(autoPath, StandardCharsets.UTF_8)) {
+            writer.write("image_name,folder_name,polarization,season,label_flooding,score,probability");
+            writer.newLine();
+
+            for (ImageRecord rec : records) {
+                double zRaw = (stddev > 0.0) ? (rec.rawMean - mean) / stddev : 0.0;
+                double normBlack = rec.blackDiameter / maxBlack;
+                double normWhite = rec.whiteDiameter / maxWhite;
+
+                double seasonBias = seasonBias(rec.season);
+                double polBias = polarizationBias(rec.polarization);
+                double shapeBias = shapeBias(rec.dominantShape);
+
+                double score = zRaw + (0.6 * normBlack) + (0.6 * normWhite) + seasonBias + polBias + shapeBias;
+                double probability = 1.0 / (1.0 + Math.exp(-score));
+
+                List<String> row = Arrays.asList(
+                        rec.imageName,
+                        rec.folderName,
+                        rec.polarization,
+                        rec.season,
+                        Boolean.toString(rec.flooding),
+                        Double.toString(score),
+                        Double.toString(probability)
+                );
+                writer.write(escapeCsvRow(row));
+                writer.newLine();
+            }
+        }
+
+        System.out.println("[INFO] Auto_Probabilities.csv written with lightweight logistic-style scores in: " + rootFolder);
+    }
+
+    private static double seasonBias(String season) {
+        if (season == null) return 0.0;
+        switch (season) {
+            case "Summer":
+                return 0.25;
+            case "Spring":
+            case "Fall":
+                return 0.15;
+            case "Winter":
+                return -0.05;
+            default:
+                return 0.0;
+        }
+    }
+
+    private static double polarizationBias(String pol) {
+        if (pol == null) return 0.0;
+        switch (pol.toUpperCase(Locale.ROOT)) {
+            case "VH":
+                return 0.2;
+            case "VV":
+                return 0.05;
+            default:
+                return 0.0;
+        }
+    }
+
+    private static double shapeBias(String dominantShape) {
+        if (dominantShape == null || dominantShape.isEmpty()) return 0.0;
+        String lower = dominantShape.toLowerCase(Locale.ROOT);
+        if (lower.contains("elongated")) return 0.1;
+        if (lower.contains("compact")) return 0.05;
+        if (lower.contains("spread")) return 0.02;
+        return 0.0;
     }
 }
+
