@@ -16,13 +16,68 @@ The script’s performance evaluation shows that it scales linearly with image s
 Inputs
 •	A directory folder with numeric subfolders 1/…/134/.
 •	In each folder: TIFF images (.tif/.tiff) and GeoJSON(s) numbered by geographic identifier.
+
 Outputs (in directory)
-•	Summary.csv:
- Image, Total grayscale pixels, Unique grayscale shades, Black Diameter, White Diameter, Black Width, Black Height, White Width, White Height, Black Shape, White Shape
-•	All_Images_Counts.csv:
- Image, Flooding (T/F), #000000, #000001, … (all unique greys across all processed images)
-•	Skipped.csv:
- Image, Folder, Reason
+### 1) `Images_All.csv` — per-image feature table
+Each row corresponds to one processed image.
+#### Core columns
+- `image_name`
+- `folder_name` (numeric folder or `ROOT`)
+- `polarization` (`VV` | `VH` | `OTHER`)
+- `flooding` (`true` | `false`)
+- `season` (`Winter` | `Spring` | `Summer` | `Fall` | `Unknown`)
+- `raw_mean` (mean of non-zero pixels)
+#### Black component feature columns (selected connected component)
+- `black_size`
+- `black_width`
+- `black_height`
+- `black_diameter`  (bbox diagonal)
+- `black_shape`
+#### White component feature columns
+- `white_size`
+- `white_width`
+- `white_height`
+- `white_diameter`
+- `white_shape`
+#### Derived column
+- `dominant_shape`
+#### Histogram columns
+- `RAW_00000`, `RAW_00001`, ... up to the maximum observed raw key
+- Only keys that occur anywhere in the dataset are emitted as columns.
+- Missing values for a given image are written as `0`.
+
+### 2) `Summary_All.csv` — multi-section dataset report
+This file is a single CSV that contains multiple labeled sections. (It’s designed to be human-readable *and* parseable with light scripting.)
+Sections include:
+#### `STATS`
+- Aggregate statistics over `raw_mean`
+- Includes both:
+  - unfiltered stats, and
+  - outlier-filtered stats (based on z-score filtering; i.e., restricting to values inside a standard deviation band)
+- Includes a “post-mode” concept based on aggregate RAW histogram frequency (a distribution-wide mode-like measure)
+#### `SEASONS`
+- Counts and flooding rates by `season` (and sometimes by `polarization` depending on your generator’s exact grouping)
+#### `SHAPES`
+- Counts and flooding rates by shape combinations (black/white and/or dominant), as implemented by the summarizer
+#### `WEIGHTS`
+- Coefficients used in the scoring rule:
+  - numeric feature weights (e.g., raw_mean, diameters)
+  - categorical offsets (e.g., season, polarization, shape terms)
+#### `XY_TABLE`
+- Empirical flood probabilities by:
+  - `season`, `polarization`, `black_shape`, `white_shape`
+- Often computed only for observations inside a bounded z-score region to reduce distortion from extreme outliers.
+#### `DECISION_RULE`
+- Human-readable spec of the model form:
+  - standardized feature construction
+  - linear score
+  - logistic transform
+
+### 3) `Skipped.csv` — trace log
+Each row indicates an image that was not processed:
+- `image_name`
+- `folder_name`
+- `reason`
 
 **Simplified high-level architecture:**
 Single self-contained Java program organized into three subsystems:
