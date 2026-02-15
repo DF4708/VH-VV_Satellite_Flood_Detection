@@ -12,7 +12,8 @@ import java.util.*;
 import java.util.concurrent.*;
 
 /**
- * Data_Extraction_M1_Optimized
+ * Data_Extraction_M1_Optimized - **ALL RIGHTS RESERVED**
+ * Expressed written and verbal permission must be given by the author for the use, modification, and or distribution of this code.
  *
  * WHAT:
  *   Multi-core Java-only extractor for SEN12FLOOD-style data using S1list.json and S2list.json.
